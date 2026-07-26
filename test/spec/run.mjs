@@ -131,6 +131,51 @@ const MEASURED_CAP_KEYS = [
 
 const readRepo = (rel) => readFileSync(join(root, rel), 'utf8')
 
+// ---- cycle-digest census (derived, never a literal) ----------------------------
+//
+// docs/cycle-digest.jsonl is an append-only corpus whose growth is mandated by
+// AutoFlow itself: HANDOFF step 6.7 appends the cycle's own record on the cycle's
+// own dev branch (docs/autoflow-guide.md > HANDOFF 6.7). A literal record or
+// gate-object count therefore fails on EVERY future cycle, and fails at the one
+// moment — HANDOFF — where a red CI blocks the handoff. So every corpus-size
+// expectation below is derived from the file at run time.
+//
+// What the literals were actually guarding is kept as a PROPERTY, asserted here
+// once and reused by each case:
+//   (a) count in = count out — the number of non-empty JSONL lines equals the
+//       number of records the loader yields, so a truncation or a silently
+//       dropped record is loud;
+//   (b) no malformed line — a line the loader cannot parse would suppress the
+//       records that follow it in a stop-at-first-error loader, and is reported
+//       as a digest-unparseable finding here;
+//   (c) the loader's gate-object walk agrees with an independent raw-line walk,
+//       so the two halves cross-check each other rather than restating one count.
+const DIGEST = 'docs/cycle-digest.jsonl'
+
+const gateObjectsOf = (records) =>
+  records.reduce((n, r) => n + Object.values(r.gates || {}).filter((g) => g && g.items).length, 0)
+
+function digestCensus() {
+  const text = readRepo(DIGEST)
+  const lines = text.split('\n').filter((l) => l.trim() !== '')
+  const { records, findings } = REPLAY.parseDigest(text)
+  assert.ok(lines.length > 0, 'the digest corpus is empty — the replay subject vanished')
+  assert.deepEqual(
+    findings.filter((f) => f.code === 'digest-unparseable'), [],
+    'a malformed digest line would suppress the records after it',
+  )
+  assert.equal(
+    records.length, lines.length,
+    `count in = count out: ${lines.length} non-empty line(s) but ${records.length} record(s) loaded`,
+  )
+  const gateObjects = gateObjectsOf(records)
+  const rawGateObjects = lines.reduce(
+    (n, l) => n + Object.values(JSON.parse(l).gates || {}).filter((g) => g && g.items).length, 0)
+  assert.equal(gateObjects, rawGateObjects, 'the loader dropped or duplicated a gate object')
+  assert.ok(gateObjects > 0, 'no pass-shaped gate object in the corpus — the differential would be vacuous')
+  return { text, lines, records, findings, gateObjects }
+}
+
 // ================================================================================
 // PARSER — the YAML subset is a first-class verification subject (§3)
 // ================================================================================
@@ -959,7 +1004,7 @@ for (const [label, scores] of DIFFERENTIAL) {
 }
 
 await test('O-3 differential (L15): every recorded gate item set in the corpus matches the executed hook', () => {
-  const lines = readRepo('docs/cycle-digest.jsonl').trim().split('\n')
+  const { lines, gateObjects } = digestCensus()
   let compared = 0
   for (const line of lines) {
     for (const g of Object.values(JSON.parse(line).gates)) {
@@ -968,7 +1013,9 @@ await test('O-3 differential (L15): every recorded gate item set in the corpus m
       compared++
     }
   }
-  assert.equal(compared, 64, 'expected 64 pass-shaped gate objects across the 13 records')
+  // Derived, not literal (see digestCensus): every pass-shaped gate object the
+  // loader sees must also have been differentiated against the executed hook.
+  assert.equal(compared, gateObjects, 'a gate object in the corpus escaped the differential')
 })
 
 // ================================================================================
@@ -1335,28 +1382,75 @@ await test('AC-F1.5g: only the typed non-evaluability signal is contained — an
   )
 })
 
+// The baseline fixture is a FROZEN artifact: it was generated at 817b414 over the
+// corpus as it stood at b2cea72 — its first 13 records. It is deliberately NOT
+// regenerated per cycle, because regenerating it on every HANDOFF append would
+// make it a restatement of current behaviour rather than a pre-change baseline.
+// The corpus is append-only (records are never edited or deleted, and the loader
+// preserves file order), so those 13 records are immutable and the fixture stays
+// an exact oracle over them forever. The full-strength deepEqual is therefore
+// SCOPED to the prefix the fixture covers — not weakened to a subset comparison —
+// and the records appended after it are covered by the append-only monotonicity
+// assertion below: growth may add findings, never remove or alter a baseline one.
+// replay-baseline.json is finding-shaped, so on its own it cannot see a record
+// vanish (a lost record that produced no finding is invisible, and the next record
+// silently shifts into the prefix). replay-baseline-records.json pins the IDENTITY
+// and order of the 13 records the fixture was generated over — the cheapest thing
+// that makes "the fixture's covered prefix" a checkable claim instead of an
+// index range. Both fixtures are frozen together; neither grows with the corpus.
+const baselineRecordIds = () => JSON.parse(readRepo('test/spec/fixtures/replay-baseline-records.json'))
+const idOfRecord = (r) => ({ issue: r.issue, terminal_cycle: r.terminal_cycle, date: r.date })
+
 await test('AC-F1.5b: the real corpus replay is unaffected — full deep-equality against the pre-change fixture', () => {
-  const { records } = REPLAY.parseDigest(readRepo('docs/cycle-digest.jsonl'))
+  const { records } = digestCensus()
+  const ids = baselineRecordIds()
   const baseline = JSON.parse(readRepo('test/spec/fixtures/replay-baseline.json'))
-  assert.deepEqual(REPLAY.replay(spec(), records), baseline)
+  assert.ok(records.length >= ids.length,
+    `the corpus shrank below the fixture's frozen extent: ${records.length} < ${ids.length}`)
+  // Append-only: the covered prefix is immutable, so its identity must match
+  // before the finding comparison means anything.
+  assert.deepEqual(records.slice(0, ids.length).map(idOfRecord), ids,
+    'the fixture-covered prefix was reordered, edited or lost a record')
+  assert.deepEqual(REPLAY.replay(spec(), records.slice(0, ids.length)), baseline)
+})
+
+await test('AC-F1.5b (append-only): the grown corpus still yields every baseline finding — growth adds, never removes', () => {
+  const { records } = digestCensus()
+  const baseline = JSON.parse(readRepo('test/spec/fixtures/replay-baseline.json'))
+  const now = REPLAY.replay(spec(), records).map((f) => JSON.stringify(f))
+  for (const f of baseline) {
+    assert.ok(now.includes(JSON.stringify(f)),
+      `a baseline finding disappeared from the full-corpus replay: ${JSON.stringify(f)}`)
+  }
 })
 
 await test('AC-F1.5c: the corpus contains no out-of-domain value (the premise of AC-F1.5b)', () => {
-  const { records } = REPLAY.parseDigest(readRepo('docs/cycle-digest.jsonl'))
+  // The premise F1.5b rests on is a PROPERTY — every recorded item value is a
+  // finite number, i.e. in the oracle's domain — not a count. The former
+  // [13, 64, 322] tripwire pinned the corpus size, which the mandated HANDOFF 6.7
+  // append breaks every cycle. The property below holds over any corpus size and
+  // still fails loudly the moment an out-of-domain value is appended; the census
+  // cross-check keeps a truncated or partially-loaded corpus from passing it
+  // vacuously.
+  const census = digestCensus()
   let gateObjects = 0
   let values = 0
-  for (const rec of records) {
+  for (const rec of census.records) {
     for (const g of Object.values(rec.gates || {})) {
       if (!g || !g.items) continue
       gateObjects++
+      let seen = 0
       for (const v of Object.values(g.items)) {
         const u = v !== null && typeof v === 'object' ? v.score : v
         assert.ok(Number.isFinite(u), `out-of-domain corpus value in ${rec.issue}: ${JSON.stringify(v)}`)
         values++
+        seen++
       }
+      assert.ok(seen > 0, `${rec.issue}: a pass-shaped gate object carries an empty items map`)
     }
   }
-  assert.deepEqual([records.length, gateObjects, values], [13, 64, 322], 'the three counts are the intended tripwire when the digest grows')
+  assert.equal(gateObjects, census.gateObjects, 'this walk and the census disagree on the gate-object count')
+  assert.ok(values >= gateObjects, 'every gate object must contribute at least one scored value')
 })
 
 // ---- AC-F1.6: the existing gate suite is unchanged ----------------------------
@@ -2041,7 +2135,7 @@ await test('R12/AC2.0: the traversed (step, outcome) set EQUALS the set derived 
 // REPLAY — AC3
 // ================================================================================
 
-const DIGEST = 'docs/cycle-digest.jsonl'
+// DIGEST and digestCensus() are defined once, above the parser section.
 const digestText = () => readRepo(DIGEST)
 const parsed = () => REPLAY.parseDigest(digestText())
 const round1 = (x) => Math.round(x * 10) / 10
@@ -2053,10 +2147,12 @@ const round1 = (x) => Math.round(x * 10) / 10
 const idOf = (f) => ({ severity: f.severity, code: f.code, where: f.where })
 const sortIds = (fs) => fs.map(idOf).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
 
-await test('AC3.1: the loader reads exactly 13 records and every record is replayed (count in = count out)', () => {
-  const { records, findings } = parsed()
-  assert.equal(digestText().trim().split('\n').length, 13, 'a truncation of the corpus must be loud')
-  assert.equal(records.length, 13)
+await test('AC3.1: the loader reads every corpus line as a record and every record is replayed (count in = count out)', () => {
+  // digestCensus derives the expected record count from the file's non-empty line
+  // count instead of pinning a literal (the corpus grows at every HANDOFF 6.7),
+  // and fails loudly when the two disagree — truncation, or a malformed line
+  // suppressing the records after it.
+  const { records, findings } = digestCensus()
   assert.deepEqual(findings, [], 'the checked-in corpus parses cleanly')
   const replayed = REPLAY.replay(spec(), records)
   assert.ok(Array.isArray(replayed))
@@ -2065,7 +2161,7 @@ await test('AC3.1: the loader reads exactly 13 records and every record is repla
 })
 
 await test('AC3.7: every recorded gate avg is reproduced by the O-3 calculator at 1 dp (0 per-record findings)', () => {
-  const { records } = parsed()
+  const { records, gateObjects } = digestCensus()
   let compared = 0
   for (const rec of records) {
     for (const [name, g] of Object.entries(rec.gates)) {
@@ -2075,13 +2171,13 @@ await test('AC3.7: every recorded gate avg is reproduced by the O-3 calculator a
       compared++
     }
   }
-  assert.equal(compared, 64)
+  assert.equal(compared, gateObjects, 'a gate object in the corpus escaped the avg comparison')
   const f = REPLAY.replay(spec(), records)
-  assert.deepEqual(codes(f, 'avg-mismatch'), [], 'the 1-dp rule absorbs the 8 float-equality divergences')
+  assert.deepEqual(codes(f, 'avg-mismatch'), [], 'the 1-dp rule absorbs the float-equality divergences')
 })
 
-await test('AC3.7b/D21: the recorded below7 set is reproduced order-insensitively over all 64 gate objects', () => {
-  const { records } = parsed()
+await test('AC3.7b/D21: the recorded below7 set is reproduced order-insensitively over every corpus gate object', () => {
+  const { records, gateObjects } = digestCensus()
   let compared = 0
   for (const rec of records) {
     for (const [name, g] of Object.entries(rec.gates)) {
@@ -2090,7 +2186,7 @@ await test('AC3.7b/D21: the recorded below7 set is reproduced order-insensitivel
       compared++
     }
   }
-  assert.equal(compared, 64)
+  assert.equal(compared, gateObjects, 'a gate object in the corpus escaped the below7 comparison')
   assert.deepEqual(codes(REPLAY.replay(spec(), records), 'below7-mismatch'), [])
 })
 
@@ -2200,12 +2296,20 @@ await test('AC3/D16: a malformed JSONL line yields a digest-unparseable finding 
   assert.ok(carries, `the finding must carry the 1-based line number 7: ${JSON.stringify(hit)}`)
 })
 
-await test('AC3/D16: parsing continues past a malformed line — the other 13 records still replay', () => {
-  const lines = digestText().trim().split('\n')
+await test('AC3/D16: parsing continues past a malformed line — every other record still replays', () => {
+  // Both expectations are derived from the clean corpus at run time: injecting one
+  // malformed line must cost exactly that line and nothing else, whatever the
+  // corpus size is. A stop-at-first-error loader drops the records after line 7 and
+  // both counts fall below the clean-corpus values.
+  const clean = digestCensus()
+  const expectedFindings = REPLAY.replay(spec(), clean.records).length
+  const lines = clean.lines.slice()
   lines.splice(6, 0, '{"issue":"#99", TRUNCATED')
   const { records } = REPLAY.parseDigest(`${lines.join('\n')}\n`)
-  assert.equal(records.length, 13, 'a throw would suppress the other records and invert "report, never reconcile"')
-  assert.equal(REPLAY.replay(spec(), records).length, 4)
+  assert.equal(records.length, clean.records.length,
+    'a throw would suppress the other records and invert "report, never reconcile"')
+  assert.equal(REPLAY.replay(spec(), records).length, expectedFindings,
+    'the surviving records must replay to the same finding set as the clean corpus')
 })
 
 // ---- AC3.2 mismatch families, driven synthetically ------------------------------

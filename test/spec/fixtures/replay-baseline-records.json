@@ -1,0 +1,67 @@
+[
+  {
+    "issue": "#1",
+    "terminal_cycle": 1,
+    "date": "2026-07-11"
+  },
+  {
+    "issue": "#3",
+    "terminal_cycle": 1,
+    "date": "2026-07-16"
+  },
+  {
+    "issue": "#10",
+    "terminal_cycle": 2,
+    "date": "2026-07-16"
+  },
+  {
+    "issue": "#16",
+    "terminal_cycle": 2,
+    "date": "2026-07-17"
+  },
+  {
+    "issue": "#11",
+    "terminal_cycle": 1,
+    "date": "2026-07-17"
+  },
+  {
+    "issue": "#18",
+    "terminal_cycle": 1,
+    "date": "2026-07-17"
+  },
+  {
+    "issue": "#6",
+    "terminal_cycle": 1,
+    "date": "2026-07-17"
+  },
+  {
+    "issue": "#13",
+    "terminal_cycle": 1,
+    "date": "2026-07-17"
+  },
+  {
+    "issue": "#25",
+    "terminal_cycle": 3,
+    "date": "2026-07-18"
+  },
+  {
+    "issue": "#14",
+    "terminal_cycle": 2,
+    "date": "2026-07-24"
+  },
+  {
+    "issue": "#30",
+    "terminal_cycle": 4,
+    "date": "2026-07-25"
+  },
+  {
+    "issue": "#26",
+    "terminal_cycle": 1,
+    "date": "2026-07-25"
+  },
+  {
+    "issue": "#35",
+    "terminal_cycle": 1,
+    "date": "2026-07-26"
+  }
+]
