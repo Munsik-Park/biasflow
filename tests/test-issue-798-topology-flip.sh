@@ -432,6 +432,8 @@ else
     # scenarios (README.md / docs/maintained-docs.md / setup/manifest.json
     # already admitted above).
     ".github/workflows/spec-simulator.yml"
+    # REUSE bulk-annotation coverage for the spec/**.yaml declarations
+    "REUSE.toml"
     "engine/gate.mjs"
     "engine/lint.mjs"
     "engine/replay.mjs"

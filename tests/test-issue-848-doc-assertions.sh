@@ -543,6 +543,8 @@ else
     # admitted above; README.md not yet a member of this suite's list).
     "README.md"
     ".github/workflows/spec-simulator.yml"
+    # REUSE bulk-annotation coverage for the spec/**.yaml declarations
+    "REUSE.toml"
     "engine/gate.mjs"
     "engine/lint.mjs"
     "engine/replay.mjs"
