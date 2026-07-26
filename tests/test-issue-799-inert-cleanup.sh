@@ -573,6 +573,7 @@ else
     "engine/spec-load.mjs"
     "test/spec/fixtures/self-test-fail.mjs"
     "test/spec/fixtures/self-test-pass.mjs"
+    "test/spec/fixtures/replay-baseline.json"
     "test/spec/manual-scenarios.md"
     "test/spec/run.mjs"
   )

@@ -413,6 +413,272 @@ await test('AC1.4 direction B negative: a cap key naming a declared but UNBOUNDE
   assert.ok(JSON.stringify(f[0]).includes('integrate'))
 })
 
+// ================================================================================
+// LINT — cycle 2, reviewer finding 2 (cap coverage checked per owner, not per edge)
+// ================================================================================
+//
+// Verification design .autoflow/issue-2-c2-verification-design.md §3; feature
+// design decisions E8-E13. Every case clones the spec (D10 — spec/ is never
+// mutated). The existing AC1.4 cases above are retained verbatim; the rows below
+// are additional, never replacements.
+
+const capMissing = (sp) => codes(LINT.lint(sp), 'cap-missing')
+const capOrphan = (sp) => codes(LINT.lint(sp), 'cap-orphan')
+
+// The required cap-key derivation, re-derived HERE from (spec, tables) so the
+// lint is not validated against a rule it supplies itself (D12). E11 revised:
+// a CAP_LOOPS row's step-side test is isBounded, NOT a literal `loop:` block.
+function requiredCapKeys(sp) {
+  const bounded = (st) => !!st.loop || mhas(st.next, 'cap-exhausted')
+  const keys = new Set()
+  for (const [k, row] of Object.entries(RT.CAP_EDGES)) {
+    const [id, outcome] = k.split(':')
+    const st = mget(sp.steps, id)
+    if (st && mhas(st.next, outcome)) keys.add(row.capKey)
+  }
+  for (const [id, row] of Object.entries(RT.CAP_LOOPS)) {
+    const st = mget(sp.steps, id)
+    if (st && bounded(st)) keys.add(row.capKey)
+  }
+  return [...keys].sort()
+}
+
+await test('F2.1: deleting handoff.review-response while a sibling cap under the same owner survives is reported', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['handoff.review-response']
+  const f = capMissing(sp)
+  assert.equal(f.length, 1, 'the owner-level check finds the surviving sibling and reports coverage as satisfied')
+  assert.equal(f[0].where, 'handoff.review-response')
+  assert.equal(f[0].step, 'handoff')
+  assert.deepEqual(capOrphan(sp), [])
+})
+
+await test('F2.2: deleting handoff.env-retry (the mirrored sibling case) is reported', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['handoff.env-retry']
+  const f = capMissing(sp)
+  assert.equal(f.length, 1)
+  assert.equal(f[0].where, 'handoff.env-retry')
+  assert.equal(f[0].step, 'handoff')
+  assert.deepEqual(capOrphan(sp), [])
+})
+
+await test('F2.3: both handoff siblings deleted → both reported, not one', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['handoff.review-response']
+  delete sp.binding.caps['handoff.env-retry']
+  const f = capMissing(sp)
+  assert.equal(f.length, 2)
+  assert.deepEqual(f.map((x) => x.where).sort(), ['handoff.env-retry', 'handoff.review-response'])
+})
+
+await test('F2.4: regression — a single-cap owner still yields exactly one finding, now keyed by cap key', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['audit.retry']
+  const f = capMissing(sp)
+  assert.equal(f.length, 1)
+  assert.ok(JSON.stringify(f[0]).includes('audit'))
+  assert.equal(f[0].where, 'audit.retry')
+  assert.equal(f[0].step, 'audit')
+})
+
+await test('F2.5: D20 shared counter within one step — verify.round-trips has two CAP_EDGES rows and yields one finding', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['verify.round-trips']
+  const f = capMissing(sp)
+  assert.equal(f.length, 1, 'requirements deduplicate by cap key, which is what preserves D20 shared counters')
+  assert.equal(f[0].where, 'verify.round-trips')
+})
+
+await test('F2.6: D20 shared counter across two steps — gate_plan.retry (gate_plan:fail + verify:design-contradiction) yields one finding', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['gate_plan.retry']
+  const f = capMissing(sp)
+  assert.equal(f.length, 1)
+  assert.equal(f[0].where, 'gate_plan.retry')
+})
+
+await test('F2.7: CAP_LOOPS path — architect.loop', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['architect.loop']
+  const f = capMissing(sp)
+  assert.equal(f.length, 1)
+  assert.equal(f[0].where, 'architect.loop')
+})
+
+await test('F2.8: CAP_LOOPS path — refine.retry, the row that pins E11’s revised applicability rule', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['refine.retry']
+  const f = capMissing(sp)
+  assert.equal(f.length, 1)
+  assert.equal(f[0].where, 'refine.retry', 'refine declares no loop: yet carries a CAP_LOOPS row, so it is claimed by Arm A only because applicability tests isBounded (E11 revised); under the rejected literal-loop: rule this would be "refine" from Arm B')
+  assert.equal(f[0].step, 'refine')
+})
+
+await test('F2.8b: E11 revised, stated directly on the real tree so the rule cannot silently regress', () => {
+  const refine = stepOf(spec(), 'refine')
+  assert.ok(!refine.loop, 'refine declares no loop: block')
+  assert.ok(mhas(refine.next, 'cap-exhausted'), 'refine is bounded through cap-exhausted')
+  assert.ok(requiredCapKeys(spec()).includes('refine.retry'))
+})
+
+await test('F2.9: remaining declaration-sourced keys — gate_hypothesis.retry and gate_quality.retry', () => {
+  for (const key of ['gate_hypothesis.retry', 'gate_quality.retry']) {
+    const sp = cloneSpec(spec())
+    delete sp.binding.caps[key]
+    const f = capMissing(sp)
+    assert.equal(f.length, 1, `${key}: expected exactly one finding`)
+    assert.equal(f[0].where, key)
+  }
+})
+
+await test('F2.10: E13 — a required key present but 0 is a gap', () => {
+  const sp = cloneSpec(spec())
+  sp.binding.caps['handoff.review-response'] = 0
+  const f = capMissing(sp)
+  assert.equal(f.length, 1)
+  assert.equal(f[0].where, 'handoff.review-response')
+})
+
+await test('F2.11: E13 — a required key present but non-integer is a gap', () => {
+  for (const bad of ['7', 2.5]) {
+    const sp = cloneSpec(spec())
+    sp.binding.caps['handoff.review-response'] = bad
+    const f = capMissing(sp)
+    assert.equal(f.length, 1, `${JSON.stringify(bad)}: expected exactly one finding`)
+    assert.equal(f[0].where, 'handoff.review-response')
+  }
+})
+
+await test('F2.12: regression — Arm B, a bounded step named by no applying table row', () => {
+  const sp = cloneSpec(spec())
+  mget(sp.steps, 'integrate').next.set('cap-exhausted', 'escalate')
+  const f = capMissing(sp)
+  assert.equal(f.length, 1)
+  assert.ok(JSON.stringify(f[0]).includes('integrate'))
+  assert.equal(f[0].where, 'integrate')
+})
+
+await test('F2.13: E10 — the two arms never double-report on a step that IS named by a table row', () => {
+  const sp = cloneSpec(spec())
+  delete sp.binding.caps['audit.retry']
+  assert.equal(capMissing(sp).length, 1, 'Arm B must skip audit, which CAP_EDGES["audit:fail"] already claims')
+})
+
+await test('F2.14: E11 — a table row whose step is absent from the clone raises no phantom', () => {
+  const sp = cloneSpec(spec())
+  sp.steps.delete('refine')
+  assert.deepEqual(capMissing(sp).filter((x) => x.where === 'refine.retry'), [])
+  const orphans = capOrphan(sp).filter((x) => x.where === 'refine.retry')
+  assert.equal(orphans.length, 1, 'the now-dangling key is reported once, by the orphan direction')
+})
+
+await test('F2.15: E11 — a CAP_EDGES row whose outcome is absent raises no phantom', () => {
+  const sp = cloneSpec(spec())
+  mget(sp.steps, 'handoff').next.delete('review-findings')
+  assert.deepEqual(capMissing(sp).filter((x) => x.where === 'handoff.review-response'), [])
+})
+
+await test('F2.16: E11 — a CAP_LOOPS row whose step becomes unbounded raises no phantom', () => {
+  const sp = cloneSpec(spec())
+  delete mget(sp.steps, 'architect').loop
+  assert.ok(!mhas(mget(sp.steps, 'architect').next, 'cap-exhausted'), 'architect declares no cap-exhausted, so isBounded becomes false')
+  assert.deepEqual(capMissing(sp).filter((x) => x.where === 'architect.loop'), [])
+})
+
+await test('F2.17: structural — the derived requirement set is exactly the declared binding (9 keys)', () => {
+  const derived = requiredCapKeys(spec())
+  assert.equal(derived.length, 9, 'nine holds only under E11’s revised rule; the literal-loop: rule yields eight')
+  assert.deepEqual(derived, MEASURED_CAP_KEYS)
+})
+
+await test('F2.18: structural — every bounded step is claimed by an applying row (Arm B is empty today)', () => {
+  const sp = spec()
+  const bounded = boundedStepsOf(sp)
+  assert.deepEqual(bounded, MEASURED_BOUNDED)
+  const claimed = new Set(requiredCapKeys(sp).map((k) => k.split('.')[0]))
+  for (const id of bounded) {
+    assert.ok(claimed.has(id), `bounded step ${id} is claimed by no applying CAP_EDGES/CAP_LOOPS row`)
+  }
+})
+
+await test('F2.19: regression — the real tree stays clean under the whole lint', () => {
+  const f = LINT.lint(spec())
+  assert.deepEqual(codes(f, 'cap-missing'), [])
+  assert.deepEqual(codes(f, 'cap-orphan'), [])
+  assert.deepEqual(f, [])
+})
+
+await test('F2.20: regression — orphan direction, undeclared owner', () => {
+  const sp = cloneSpec(spec())
+  sp.binding.caps['nosuchstep.retry'] = 2
+  const f = capOrphan(sp)
+  assert.equal(f.length, 1)
+  assert.ok(JSON.stringify(f[0]).includes('nosuchstep'))
+})
+
+await test('F2.21: regression — orphan direction, declared but unbounded owner', () => {
+  const sp = cloneSpec(spec())
+  sp.binding.caps['integrate.retry'] = 2
+  const f = capOrphan(sp)
+  assert.equal(f.length, 1)
+  assert.ok(JSON.stringify(f[0]).includes('integrate'))
+})
+
+await test('F2.22: E12 residual is pinned — an extra key under a bounded owner is deliberately not flagged', () => {
+  const sp = cloneSpec(spec())
+  sp.binding.caps['handoff.bogus'] = 2
+  assert.deepEqual(capOrphan(sp), [], 'check 5 was deliberately not extended to the required set (E12)')
+  assert.deepEqual(capMissing(sp), [])
+})
+
+await test('F2.23: E12 self-limit — a mistyped binding key is still caught by Arm A', () => {
+  const sp = cloneSpec(spec())
+  sp.binding.caps['handoff.review_response'] = sp.binding.caps['handoff.review-response']
+  delete sp.binding.caps['handoff.review-response']
+  const f = capMissing(sp)
+  assert.equal(f.length, 1)
+  assert.equal(f[0].where, 'handoff.review-response')
+})
+
+await test('F2.24: purity — lint() mutates neither the spec nor the routing tables', () => {
+  const sp = cloneSpec(spec())
+  const snapSpec = JSON.stringify({
+    caps: sp.binding.caps,
+    next: mkeys(sp.steps).map((id) => [id, mkeys(mget(sp.steps, id).next).map((k) => [k, mget(mget(sp.steps, id).next, k)])]),
+  })
+  const snapTables = JSON.stringify({ edges: RT.CAP_EDGES, loops: RT.CAP_LOOPS })
+  LINT.lint(sp)
+  assert.equal(JSON.stringify({
+    caps: sp.binding.caps,
+    next: mkeys(sp.steps).map((id) => [id, mkeys(mget(sp.steps, id).next).map((k) => [k, mget(mget(sp.steps, id).next, k)])]),
+  }), snapSpec, 'findings are reported, never reconciled (engine/lint.mjs:6-7)')
+  assert.equal(JSON.stringify({ edges: RT.CAP_EDGES, loops: RT.CAP_LOOPS }), snapTables)
+})
+
+await test('F2.25: regression — the other three lint checks are untouched by the check-4 rewrite', () => {
+  assert.deepEqual(codes(LINT.lint(spec()), 'next-target-unresolved'), [])
+  assert.deepEqual(codes(LINT.lint(spec()), 'agent-undeclared'), [])
+  assert.deepEqual(codes(LINT.lint(spec()), 'gate-incomplete'), [])
+
+  const a = cloneSpec(spec())
+  mget(a.steps, 'red').next.set('x', 'nosuchstep')
+  assert.equal(codes(LINT.lint(a), 'next-target-unresolved').length, 1)
+
+  const b = cloneSpec(spec())
+  mget(b.steps, 'green').agents = ['nosuchrole']
+  assert.equal(codes(LINT.lint(b), 'agent-undeclared').length, 1)
+
+  const c = cloneSpec(spec())
+  delete mget(c.steps, 'gate_plan').criteria
+  assert.equal(codes(LINT.lint(c), 'gate-incomplete').length, 1)
+
+  const d = cloneSpec(spec())
+  mget(d.roles, 'evaluator').session = 'persistent'
+  assert.equal(codes(LINT.lint(d), 'gate-incomplete').length, GATE_STEPS.length)
+})
+
+
 await test('AC1 tree properties: no colon-in-value and no "#" inside a quoted value under spec/', () => {
   spec() // the properties are only meaningful against a tree the parser accepted
   const files = []
@@ -603,6 +869,309 @@ await test('O-3 differential (L15): every recorded gate item set in the corpus m
   }
   assert.equal(compared, 64, 'expected 64 pass-shaped gate objects across the 13 records')
 })
+
+// ================================================================================
+// GATE — cycle 2, reviewer finding 1 (fail-open on a value the oracle refuses)
+// ================================================================================
+//
+// Verification design .autoflow/issue-2-c2-verification-design.md §1-§2; feature
+// design decisions E1-E6, E15. Nothing below transcribes the oracle: every
+// expectation is COMPUTED by executing the jq program extracted from the hook at
+// run time (hookOutcome) and comparing it with the mirror (mirrorOutcome). The
+// rows are inputs only.
+
+// `hookVerdict` above assumes exit 0 and would throw on the inputs this cycle
+// introduces; it stays as-is so the 12 existing DIFFERENTIAL rows are untouched.
+// This sibling captures the failure instead of propagating it (harness work, not
+// an engine change). Results are memoised because the safety-invariant test
+// (AC-F1.3) re-walks the same corpus and `jq` is a process spawn.
+const _hookOutcomeCache = new Map()
+function hookOutcome(scores) {
+  const state = JSON.stringify({ phases: { g: { scores } } })
+  if (_hookOutcomeCache.has(state)) return _hookOutcomeCache.get(state)
+  let res
+  try {
+    const out = execFileSync('jq', ['--arg', 'phase', 'g', hookScoresProgram()], {
+      input: state,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    res = { ok: true, verdict: JSON.parse(out) }
+  } catch (err) {
+    res = { ok: false, status: err.status }
+  }
+  _hookOutcomeCache.set(state, res)
+  return res
+}
+
+// The mirror side, captured symmetrically. An error that is NOT the typed
+// non-evaluability signal is re-thrown rather than swallowed, so a genuine bug
+// surfaces as a failure instead of masquerading as agreement with a jq exit 5.
+function mirrorOutcome(scores) {
+  try {
+    return { ok: true, verdict: project(GATE.computeVerdict(scores)) }
+  } catch (e) {
+    if (!e || e.code !== 'scores-not-evaluable') throw e
+    return { ok: false, error: e }
+  }
+}
+
+await test('V-1: the differential oracle is jq >= 1.7 — the grammar every F1 row is measured against', () => {
+  const raw = String(execFileSync('jq', ['--version'], { encoding: 'utf8' })).trim()
+  console.log(`        jq version: ${raw}`) // M-1 reads this line out of the CI log
+  const m = raw.match(/(\d+)\.(\d+)/)
+  assert.ok(m, `unparseable jq version "${raw}"`)
+  const [maj, min] = [Number(m[1]), Number(m[2])]
+  assert.ok(maj > 1 || (maj === 1 && min >= 7), `jq "${raw}" is older than 1.7; E2's accepted-whitespace class and the E4 residual are properties of jq 1.7's number parser (measured on jq-1.7.1-apple) and may move on an older grammar`)
+})
+
+await test('V-3: hookOutcome reports a non-zero jq exit instead of throwing', () => {
+  const h = hookOutcome({ a: 'abc', b: 9 })
+  assert.equal(h.ok, false)
+  assert.equal(h.status, 5)
+})
+
+// ---- AC-F1.1: the differential parity table (E1, E2, E3, E6) -------------------
+
+const item = (v) => ({ a: v, b: 9 })
+
+// A — one row per degree of freedom in the accepted grammar (12).
+const C2_GRAMMAR = [
+  ['A1 bare number 8', item(8)],
+  ['A2 numeric string "8"', item('8')],
+  ['A3 leading zero "08"', item('08')],
+  ['A4 leading sign "+5"', item('+5')],
+  ['A5 bare leading dot ".5"', item('.5')],
+  ['A6 bare trailing dot "5."', item('5.')],
+  ['A7 exponent "1e3"', item('1e3')],
+  ['A8 exponent upper case "1E3"', item('1E3')],
+  ['A9 signed exponent "1e-2"', item('1e-2')],
+  ['A10 mantissa + exponent "0.1e1"', item('0.1e1')],
+  ['A11 object form {score: 8}', item({ score: 8 })],
+  ['A12 object form {score: "8"}', item({ score: '8' })],
+]
+
+// B — the whitespace boundary (17). The four ACCEPTED codepoints are jq's whole
+// whitespace class; the eleven REJECTED ones are all stripped by JS trim(), so
+// each is a row on which a trim()-based mirror answers pass:true and the oracle
+// exits 5. This is the class in which the first predicate failed (E2/E5).
+// Codepoints are written as escapes, never as literal characters, so the source
+// stays reviewable and no editor can normalise a row away.
+const cp = (u) => String.fromCharCode(u)
+const JQ_WS_ACCEPTED = [['U+0020', cp(0x20)], ['U+0009', cp(0x09)], ['U+000A', cp(0x0a)], ['U+000D', cp(0x0d)]]
+const JQ_WS_REJECTED = [
+  ['U+000B', cp(0x0b)], ['U+000C', cp(0x0c)], ['U+00A0', cp(0xa0)], ['U+1680', cp(0x1680)],
+  ['U+2000', cp(0x2000)], ['U+2007', cp(0x2007)], ['U+2028', cp(0x2028)], ['U+2029', cp(0x2029)],
+  ['U+202F', cp(0x202f)], ['U+205F', cp(0x205f)], ['U+3000', cp(0x3000)],
+]
+const C2_WS_ACCEPTED = JQ_WS_ACCEPTED.map(([n, c]) => [`B accepted whitespace ${n} + "8"`, item(c + '8')])
+const C2_WS = [
+  ...C2_WS_ACCEPTED,
+  ...JQ_WS_REJECTED.map(([n, c]) => [`B rejected whitespace ${n} + "8" (JS trim() strips it)`, item(c + '8')]),
+  ['B position: multiple leading whitespace "  8"', item('  8')],
+  ['B position: inner whitespace "8 8"', item('8 8')],
+]
+
+// C — rejected strings on which Number() returns a FINITE number: the only
+// rejected strings that can fail open, so each is mandatory (E15).
+const C2_REJECT_STR_FINITE = [
+  ['C empty string "" — Number("") === 0', item('')],
+  ['C whitespace-only "  " — Number("  ") === 0', item('  ')],
+  ['C hex "0x10" — Number() reads 16', item('0x10')],
+  ['C binary "0b1" — Number() reads 1', item('0b1')],
+]
+
+// D — one representative per remaining NaN-yielding reject mechanism (E15).
+const C2_REJECT_STR_NAN = [
+  ['D non-numeric "abc" — the finding’s own reproduction', item('abc')],
+  ['D trailing garbage "8abc" — full-consume', item('8abc')],
+  ['D incomplete exponent "1e"', item('1e')],
+  ['D dot with no digits "."', item('.')],
+]
+
+// E — rejected non-string types on which Number() returns a FINITE number.
+const C2_REJECT_NONSTR_FINITE = [
+  ['E null — Number(null) === 0', item(null)],
+  ['E true — Number(true) === 1', item(true)],
+  ['E false — Number(false) === 0', item(false)],
+  ['E object form {score: null} — Number(null) === 0', item({ score: null })],
+]
+
+// F — rejected non-string types on which Number() returns NaN.
+const C2_REJECT_NONSTR_NAN = [
+  ['F array []', item([])],
+  ['F object {} as an item value (no .score)', item({})],
+  ['F object form {score: "abc"}', item({ score: 'abc' })],
+  ['F object form {score: {}}', item({ score: {} })],
+]
+
+// G — structural (2).
+const C2_STRUCTURAL = [
+  ['G missing key — the same set without "b"', { a: 8 }],
+  ['G empty scores {} — the length == 0 branch', {}],
+]
+
+// Security path (13). The three starred rows are the E6 divergence: jq's total
+// order over types sorts every number before every string, so `"3" <= 3` is false
+// there and true in JS.
+const C2_SECURITY = [
+  ['S security 3 blocks', { security: 3, a: 9, b: 9 }],
+  ['S security 4 does not block', { security: 4, a: 9, b: 9 }],
+  ['S security 0 blocks', { security: 0, a: 9, b: 9 }],
+  ['S security object form {score: 3}', { security: { score: 3 }, a: 9, b: 9 }],
+  ['S security 4 with 보안 3', { security: 4, 보안: 3, a: 9 }],
+  ['S 보안 3 alias', { 보안: 3, x: 9 }],
+  ['S* numeric-string security "3" (E6)', { security: '3', a: 9, b: 9 }],
+  ['S* numeric-string security object {score: "3"} (E6)', { security: { score: '3' }, a: 9, b: 9 }],
+  ['S* numeric-string 보안 "3" (E6)', { 보안: '3', a: 9, b: 9 }],
+  ['S numeric-string security "7.5" above the block threshold', { security: '7.5', a: 9 }],
+  ['S non-numeric security "abc"', { security: 'abc', a: 9, b: 9 }],
+  ['S null security', { security: null, a: 9, b: 9 }],
+  ['S boolean security true', { security: true, a: 9, b: 9 }],
+]
+
+const DIFFERENTIAL_C2 = [
+  ...C2_GRAMMAR, ...C2_WS, ...C2_REJECT_STR_FINITE, ...C2_REJECT_STR_NAN,
+  ...C2_REJECT_NONSTR_FINITE, ...C2_REJECT_NONSTR_NAN, ...C2_STRUCTURAL, ...C2_SECURITY,
+]
+
+for (const [label, scores] of DIFFERENTIAL_C2) {
+  await test(`AC-F1.1 differential: ${label}`, () => {
+    const h = hookOutcome(scores)
+    const m = mirrorOutcome(scores)
+    assert.equal(m.ok, h.ok, `${label}: evaluability must match the executed oracle (jq exit ${h.ok ? 0 : h.status})`)
+    if (h.ok) assert.deepEqual(m.verdict, h.verdict, `${label}: verdict must match the executed oracle`)
+  })
+}
+
+// ---- AC-F1.2: the out-of-domain residual is stated and stable (E4) -------------
+//
+// The only place the two implementations are permitted to differ. Each row is one
+// CLASS, not one spelling (E15). The "-0" row: L26's contradiction is resolved in
+// favour of rejection — executed 2026-07-27, the oracle renders `min -0` and
+// `lowest score -0` on {a:"-0",b:9} where JS `${-0}` yields "0", so an accepting
+// mirror would diverge on both `min` and `reason`; the mirror must therefore
+// reject it (an `Object.is(n, -0)` clause on the coerced value), exactly as E4
+// already states.
+const RESIDUAL_C2 = [
+  ['R the nan word form "NaN" — oracle pass:false, avg/min render as null', item('NaN')],
+  ['R the inf word form "Infinity" — the one residual row where the oracle PASSES', item('Infinity')],
+  ['R magnitude overflow "1e999" with no inf word', item('1e999')],
+  ['R jq literal preservation "-1e999" — min -1E+999 vs avg -1.7976931348623157e+308', item('-1e999')],
+  ['R negative zero "-0" — oracle min -0, JS `${-0}` is "0"', item('-0')],
+  ['R U+FEFF lead/trail asymmetry (leading accepted by the oracle, trailing not)', item(cp(0xfeff) + '8')],
+]
+
+for (const [label, scores] of RESIDUAL_C2) {
+  await test(`AC-F1.2 residual: ${label}`, () => {
+    const h = hookOutcome(scores)
+    const m = mirrorOutcome(scores)
+    assert.equal(h.ok, true, `${label}: the oracle is expected to produce a verdict here`)
+    assert.equal(m.ok, false, `${label}: this input is outside the mirror domain (E4) and must fail closed`)
+  })
+}
+
+// ---- AC-F1.3: the safety invariant, over every row (E5) ------------------------
+
+await test('AC-F1.3 safety invariant (E5): the mirror never passes where the oracle does not, over all 66 differential + residual inputs', () => {
+  const corpus = [...DIFFERENTIAL_C2, ...RESIDUAL_C2]
+  assert.equal(corpus.length, 66, 'the invariant is only as strong as the corpus it runs over')
+  for (const [label, scores] of corpus) {
+    const h = hookOutcome(scores)
+    const m = mirrorOutcome(scores)
+    const oraclePasses = h.ok && h.verdict.pass === true
+    const mirrorPasses = m.ok && m.verdict.pass === true
+    assert.ok(!(mirrorPasses && !oraclePasses), `${label}: the mirror must never pass where the oracle does not`)
+  }
+})
+
+// ---- AC-F1.4: the error contract (E1, E3) -------------------------------------
+
+await test('AC-F1.4a: the thrown value is the typed error, identifying the offending entry', () => {
+  assert.throws(
+    () => GATE.computeVerdict({ a: 8, b: 'abc', c: 9 }),
+    (e) => {
+      assert.ok(e instanceof GATE.ScoresNotEvaluableError, 'the throw must be the exported typed error')
+      assert.equal(e.name, 'ScoresNotEvaluableError')
+      assert.equal(e.code, 'scores-not-evaluable')
+      assert.equal(e.key, 'b')
+      assert.equal(e.value, 'abc')
+      return true
+    },
+  )
+})
+
+await test('AC-F1.4b: the throw precedes every branch — a corrupt value is not out-voted by a blocking security score', () => {
+  const scores = { security: 2, a: 'abc', b: 9 }
+  assert.equal(hookOutcome(scores).ok, false, 'the ordering claim is oracle-derived: jq dies before its security branch')
+  assert.throws(() => GATE.computeVerdict(scores), (e) => e.code === 'scores-not-evaluable')
+})
+
+await test('AC-F1.4c: the empty-scores branch still precedes the guard', () => {
+  const v = GATE.computeVerdict({})
+  assert.deepEqual(project(v), hookVerdict({}))
+  assert.deepEqual(v.below7, [])
+})
+
+await test('AC-F1.4d: the offending entry is deterministic (first in Object.entries order)', () => {
+  assert.throws(() => GATE.computeVerdict({ a: 'abc', b: null }), (e) => e.key === 'a')
+  assert.throws(() => GATE.computeVerdict({ b: null, a: 'abc' }), (e) => e.key === 'b')
+})
+
+await test('AC-F1.4e: the verdict shape is unchanged on every accepting item-path row', () => {
+  const accepting = [...C2_GRAMMAR, ...C2_WS_ACCEPTED, ['B position "  8"', item('  8')]]
+  assert.equal(accepting.length, 17)
+  for (const [label, scores] of accepting) {
+    const v = GATE.computeVerdict(scores)
+    assert.deepEqual(Object.keys(v).sort(), [...HOOK_FIELDS, 'below7'].sort(), `${label}: verdict shape changed`)
+  }
+})
+
+await test('AC-F1.4f: the injected-thresholds seam still governs all three comparisons after the change', () => {
+  const strict = GATE.computeVerdict({ a: 8, b: 8 }, { securityMax: 3, itemMin: 9, avgMin: 7.5 })
+  assert.equal(strict.pass, false, 'thresholds must be a parameter, not a hard-coded constant')
+})
+
+// ---- AC-F1.5: engine/replay.mjs containment (E7) ------------------------------
+
+await test('AC-F1.5a: a corrupt items object in one record does not suppress the other records findings', () => {
+  const corrupt = { issue: '#corrupt', gates: { g: { items: { a: 'abc' } } } }
+  const mismatch = { issue: '#mismatch', gates: { g: { items: { a: 8, b: 9 }, avg: 1 } } }
+  let f
+  assert.doesNotThrow(() => { f = REPLAY.replay(spec(), [corrupt, mismatch]) }, 'a throw here inverts "report, never reconcile" into "crash, report nothing" (D16)')
+  assert.ok(f.some((x) => x.where === '#corrupt'), 'the corrupt record must produce a finding of its own')
+  assert.ok(f.some((x) => x.code === 'avg-mismatch' && x.where === '#mismatch'), 'the later record’s finding must survive the earlier record’s corruption')
+})
+
+await test('AC-F1.5b: the real corpus replay is unaffected — full deep-equality against the pre-change fixture', () => {
+  const { records } = REPLAY.parseDigest(readRepo('docs/cycle-digest.jsonl'))
+  const baseline = JSON.parse(readRepo('test/spec/fixtures/replay-baseline.json'))
+  assert.deepEqual(REPLAY.replay(spec(), records), baseline)
+})
+
+await test('AC-F1.5c: the corpus contains no out-of-domain value (the premise of AC-F1.5b)', () => {
+  const { records } = REPLAY.parseDigest(readRepo('docs/cycle-digest.jsonl'))
+  let gateObjects = 0
+  let values = 0
+  for (const rec of records) {
+    for (const g of Object.values(rec.gates || {})) {
+      if (!g || !g.items) continue
+      gateObjects++
+      for (const v of Object.values(g.items)) {
+        const u = v !== null && typeof v === 'object' ? v.score : v
+        assert.ok(Number.isFinite(u), `out-of-domain corpus value in ${rec.issue}: ${JSON.stringify(v)}`)
+        values++
+      }
+    }
+  }
+  assert.deepEqual([records.length, gateObjects, values], [13, 64, 322], 'the three counts are the intended tripwire when the digest grows')
+})
+
+// ---- AC-F1.6: the existing gate suite is unchanged ----------------------------
+// Retention, not re-authoring: gate 1-12, the thresholds case, the 12-row
+// DIFFERENTIAL table and the corpus differential above are present verbatim and
+// pass. R-C2.1 (the suite summary line) is the machine check.
+
 
 // ================================================================================
 // ROUTING / SIMULATION — AC2
