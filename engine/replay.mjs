@@ -15,10 +15,26 @@
 // `pass` is replayed against the HOOK formula (D4), not the emitter's weaker
 // `below7|length == 0`; today's 13 records yield 0 divergences, which is a
 // coincidence of the corpus, not equivalence evidence.
-import { computeVerdict } from './gate.mjs'
+import { computeVerdict, round1 } from './gate.mjs'
+import { capValue } from './routing.mjs'
 
 const DIGEST = 'docs/cycle-digest.jsonl'
-const round1 = (x) => Math.round(x * 10) / 10
+
+// Table-driven cap-overrun tracking (DCR-7's `escalate` fold-in applies uniformly
+// across rows): each row names the digest field to read and the cap key that
+// bounds it. Adding the next digest-tracked cap is one row, not a new block.
+const CAP_CHECKS = [
+  {
+    metric: 'architect.rounds',
+    capKey: 'architect.loop',
+    value: (rec) => (rec.architect ? rec.architect.rounds : undefined),
+  },
+  {
+    metric: 'regressions.review_autofix_cycles',
+    capKey: 'handoff.review-response',
+    value: (rec) => (rec.regressions ? rec.regressions.review_autofix_cycles : undefined),
+  },
+]
 
 // Deliberately the opposite posture to parseYamlSubset's strict throw: there the
 // input is the contract itself; here it is a historical log whose lines are
@@ -67,7 +83,6 @@ function capFinding(where, metric, actual, expected, escalate) {
 
 export function replay(spec, records) {
   const findings = []
-  const caps = spec.binding.caps || {}
   let roundingDivergence = false
 
   for (const rec of records) {
@@ -123,16 +138,12 @@ export function replay(spec, records) {
     }
 
     const escalate = !!(rec.architect && rec.architect.escalate)
-    const rounds = rec.architect ? rec.architect.rounds : undefined
-    const loopCap = caps['architect.loop']
-    if (typeof rounds === 'number' && typeof loopCap === 'number' && rounds > loopCap) {
-      findings.push(capFinding(rec.issue, 'architect.rounds', rounds, loopCap, escalate))
-    }
-
-    const autofix = rec.regressions ? rec.regressions.review_autofix_cycles : undefined
-    const reviewCap = caps['handoff.review-response']
-    if (typeof autofix === 'number' && typeof reviewCap === 'number' && autofix > reviewCap) {
-      findings.push(capFinding(rec.issue, 'regressions.review_autofix_cycles', autofix, reviewCap, escalate))
+    for (const { metric, capKey, value } of CAP_CHECKS) {
+      const actual = value(rec)
+      const cap = capValue(spec, capKey)
+      if (typeof actual === 'number' && typeof cap === 'number' && actual > cap) {
+        findings.push(capFinding(rec.issue, metric, actual, cap, escalate))
+      }
     }
   }
 

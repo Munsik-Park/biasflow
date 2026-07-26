@@ -16,6 +16,15 @@ export function lint(spec) {
   const roleIds = new Set(spec.roles.keys())
   const caps = spec.binding.caps || {}
 
+  // Bucket cap keys by owner (the segment before the first `.`) once, so check 4
+  // below is a single lookup per step instead of a full re-scan of `caps`.
+  const capsByOwner = new Map()
+  for (const key of Object.keys(caps)) {
+    const owner = key.split('.')[0]
+    if (!capsByOwner.has(owner)) capsByOwner.set(owner, [])
+    capsByOwner.get(owner).push(key)
+  }
+
   for (const [id, step] of spec.steps) {
     // 1 — every `next` target resolves to a declared step or a reserved sentinel.
     for (const [outcome, target] of step.next) {
@@ -92,7 +101,7 @@ export function lint(spec) {
 
     // 4 — every bounded step owns at least one integer cap key in the binding.
     if (isBounded(step)) {
-      const owned = Object.keys(caps).filter((k) => k.startsWith(`${id}.`) && Number.isInteger(caps[k]) && caps[k] >= 1)
+      const owned = (capsByOwner.get(id) || []).filter((k) => Number.isInteger(caps[k]) && caps[k] >= 1)
       if (owned.length === 0) {
         findings.push({
           code: 'cap-missing',

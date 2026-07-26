@@ -78,16 +78,16 @@ export function resolve(spec, stepId, outcome) {
 }
 
 export function reachable(spec, fromId) {
+  // Seeded with fromId's own successors, never fromId itself, so fromId only
+  // lands in `seen` if a real path leads back into it (a cycle) — a plain BFS
+  // body needs no seed-vs-revisit special case this way.
   const seen = new Set()
-  const queue = [fromId]
-  let first = true
+  const seed = stepOf(spec, fromId)
+  const queue = seed ? nextEntries(seed).map(([, target]) => target).filter((t) => !RESERVED.has(t)) : []
   while (queue.length) {
     const id = queue.shift()
-    if (!first) {
-      if (seen.has(id)) continue
-      seen.add(id)
-    }
-    first = false
+    if (seen.has(id)) continue
+    seen.add(id)
     const step = stepOf(spec, id)
     if (!step) continue
     for (const [, target] of nextEntries(step)) {

@@ -110,6 +110,13 @@ export function parseYamlSubset(text, sourcePath = '<inline>') {
     return items[p].text === '-' || items[p].text.startsWith('- ') ? sequence(indent) : mapping(indent)
   }
 
+  // Shared by mapping()/sequence(): an empty `rest` after the key/dash means the
+  // value is a nested block (or absent); otherwise it's a scalar on the same line.
+  function valueFor(rest, indent, line) {
+    if (rest === '') return p < items.length && items[p].indent > indent ? block(items[p].indent) : null
+    return scalarValue(rest, indent, line)
+  }
+
   function mapping(indent) {
     const obj = {}
     while (p < items.length && items[p].indent === indent) {
@@ -119,11 +126,7 @@ export function parseYamlSubset(text, sourcePath = '<inline>') {
       if (!m) throw bad(`"${it.text}" is outside the YAML subset`, it.line)
       const rest = (m[2] || '').trim()
       p++
-      if (rest === '') {
-        obj[m[1]] = p < items.length && items[p].indent > indent ? block(items[p].indent) : null
-      } else {
-        obj[m[1]] = scalarValue(rest, indent, it.line)
-      }
+      obj[m[1]] = valueFor(rest, indent, it.line)
     }
     return obj
   }
@@ -134,11 +137,7 @@ export function parseYamlSubset(text, sourcePath = '<inline>') {
       const it = items[p]
       p++
       const rest = it.text.slice(1).trim()
-      if (rest === '') {
-        arr.push(p < items.length && items[p].indent > indent ? block(items[p].indent) : null)
-      } else {
-        arr.push(scalarValue(rest, indent, it.line))
-      }
+      arr.push(valueFor(rest, indent, it.line))
     }
     return arr
   }

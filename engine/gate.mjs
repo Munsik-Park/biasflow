@@ -27,20 +27,26 @@ export const THRESHOLDS = {
 const unwrap = (v) => (v !== null && typeof v === 'object' ? v.score : v)
 const num = (v) => Number(unwrap(v))
 
+// Shared "round to 1 dp" formula — mirrors the hook's `add/length*10 | round /10`
+// (see module header). `replay.mjs` reuses this rather than redefining it, so the
+// rounding rule lives in exactly one place.
+export const round1 = (x) => Math.round(x * 10) / 10
+
 export function computeVerdict(scores, thresholds = THRESHOLDS) {
   const entries = Object.entries(scores || {})
   if (entries.length === 0) {
     return { pass: false, avg: 0, min: 0, security: null, reason: 'evaluation not run', below7: [] }
   }
 
-  const vals = entries.map(([, v]) => num(v))
-  const avg = Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10
+  const pairs = entries.map(([k, v]) => [k, num(v)])
+  const vals = pairs.map(([, n]) => n)
+  const avg = round1(vals.reduce((a, b) => a + b, 0) / vals.length)
   const min = Math.min(...vals)
   const rawSec = scores.security !== undefined && scores.security !== null
     ? scores.security
     : (scores['보안'] !== undefined && scores['보안'] !== null ? scores['보안'] : null)
   const security = rawSec === null ? null : unwrap(rawSec)
-  const below7 = entries.filter(([, v]) => num(v) < thresholds.itemMin).map(([k]) => k).sort()
+  const below7 = pairs.filter(([, n]) => n < thresholds.itemMin).map(([k]) => k).sort()
 
   if (security !== null && security <= thresholds.securityMax) {
     return { pass: false, avg, min, security, reason: `security score ${security} — automatic rework`, below7 }
