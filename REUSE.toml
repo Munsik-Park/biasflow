@@ -13,6 +13,10 @@ path = [
   "**/*.json",
   "**/*.jsonl",
   "**/*.txt",
+  # spec/** declarations (issue #2 INTEGRATE): the declaration layer is
+  # hand-written `.yaml` carrying no header comment, unlike the `.yml`
+  # workflow/config set which does. Landed uncovered in 877435d.
+  "**/*.yaml",
   "**/*.gitkeep",
   "**/*.example",
   ".gitignore",
