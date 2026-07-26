@@ -586,6 +586,107 @@ await test('F2.16: E11 — a CAP_LOOPS row whose step becomes unbounded raises n
   assert.deepEqual(capMissing(sp).filter((x) => x.where === 'architect.loop'), [])
 })
 
+// F2.26-F2.29 make E11's "no phantom" rule DISCRIMINATING. F2.14/F2.15/F2.16
+// above delete only the step / outcome / loop and leave the binding cap key in
+// place; because that surviving key is still VALID, `cap-missing` stays empty
+// whether or not the applicability guard exists, so those three rows hold
+// vacuously. Each row below deletes the declaration side AND the cap key that
+// binds to it: now the guard is the only thing standing between the clone and a
+// `cap-missing` row for a requirement the spec no longer declares. Retained, not
+// replaced — F2.14-F2.16 stay verbatim above.
+
+await test('F2.26: E11 discriminating — a CAP_EDGES row whose OUTCOME is gone requires nothing (outcome + cap key both removed)', () => {
+  const sp = cloneSpec(spec())
+  mget(sp.steps, 'handoff').next.delete('review-findings')
+  delete sp.binding.caps['handoff.review-response']
+  assert.ok(!requiredCapKeys(sp).includes('handoff.review-response'), 'the independently derived rule drops the row with its outcome')
+  assert.deepEqual(capMissing(sp), [], 'a row that no longer applies must not demand its cap key back')
+  assert.deepEqual(capOrphan(sp), [], 'and the key is gone, so the reverse direction is silent too')
+})
+
+await test('F2.27: E11 discriminating — a CAP_EDGES row whose STEP is gone requires nothing (step + cap key both removed)', () => {
+  const sp = cloneSpec(spec())
+  sp.steps.delete('audit')
+  delete sp.binding.caps['audit.retry']
+  assert.ok(!requiredCapKeys(sp).includes('audit.retry'))
+  assert.deepEqual(capMissing(sp), [], 'CAP_EDGES["audit:fail"] must not survive the step it names')
+  assert.deepEqual(capOrphan(sp), [])
+})
+
+await test('F2.28: E11 discriminating — a CAP_LOOPS row whose STEP is gone requires nothing (step + cap key both removed)', () => {
+  const sp = cloneSpec(spec())
+  sp.steps.delete('refine')
+  delete sp.binding.caps['refine.retry']
+  assert.ok(!requiredCapKeys(sp).includes('refine.retry'))
+  assert.deepEqual(capMissing(sp), [], 'CAP_LOOPS["refine"] must not survive the step it names')
+  assert.deepEqual(capOrphan(sp), [])
+})
+
+await test('F2.29: E11 discriminating — a CAP_LOOPS row whose step becomes UNBOUNDED requires nothing (loop + cap key both removed)', () => {
+  const sp = cloneSpec(spec())
+  delete mget(sp.steps, 'architect').loop
+  delete sp.binding.caps['architect.loop']
+  assert.ok(!mhas(mget(sp.steps, 'architect').next, 'cap-exhausted'), 'architect declares no cap-exhausted, so isBounded becomes false')
+  assert.ok(!requiredCapKeys(sp).includes('architect.loop'))
+  assert.deepEqual(capMissing(sp), [], 'isBounded is the CAP_LOOPS step-side applicability test (E11 revised)')
+  assert.deepEqual(capOrphan(sp), [])
+})
+
+// F2.30/F2.31 pin the two arms' finding OBJECTS, not just their `where`. E13's
+// stated motivation is that a present-but-invalid key is distinguishable from an
+// absent one, which lives entirely in `actual`; and `severity` is what makes the
+// row blocking rather than advisory. Deep-equal so no field is left free.
+
+await test('F2.30: Arm A emits a complete finding, and `actual` distinguishes present-but-invalid from absent (E13)', () => {
+  const KEY = 'handoff.review-response'
+  const armA = (actual) => ({
+    code: 'cap-missing',
+    severity: 'error',
+    where: KEY,
+    step: 'handoff',
+    message: `bounded edge cap key "${KEY}" is not declared with an integer value ≥ 1 in the binding`,
+    expected: `a binding cap key "${KEY}" with an integer value ≥ 1`,
+    actual,
+  })
+  const absent = cloneSpec(spec())
+  delete absent.binding.caps[KEY]
+  assert.deepEqual(capMissing(absent), [armA('none')], 'an absent key reports "none"')
+
+  for (const [value, actual] of [[0, '0'], [-1, '-1'], ['7', '"7"'], [2.5, '2.5'], [null, 'null']]) {
+    const sp = cloneSpec(spec())
+    sp.binding.caps[KEY] = value
+    assert.deepEqual(capMissing(sp), [armA(actual)], `${JSON.stringify(value)}: the offending value must be reported verbatim, not collapsed into "none"`)
+  }
+})
+
+await test('F2.31: Arm B emits a complete finding, and an owned but INVALID cap key does not satisfy it', () => {
+  const armB = {
+    code: 'cap-missing',
+    severity: 'error',
+    where: 'integrate',
+    step: 'integrate',
+    message: 'bounded step "integrate" owns no "integrate." cap key with an integer value ≥ 1 in the binding',
+    expected: 'a binding cap key prefixed "integrate."',
+    actual: 'none',
+  }
+  const bare = cloneSpec(spec())
+  mget(bare.steps, 'integrate').next.set('cap-exhausted', 'escalate')
+  assert.deepEqual(capMissing(bare), [armB], 'the Arm B finding shape is part of the contract, severity included')
+
+  for (const bad of [0, '2', 1.5]) {
+    const sp = cloneSpec(spec())
+    mget(sp.steps, 'integrate').next.set('cap-exhausted', 'escalate')
+    sp.binding.caps['integrate.retry'] = bad
+    assert.deepEqual(capMissing(sp), [armB], `${JSON.stringify(bad)}: Arm B must apply the same integer ≥ 1 rule as Arm A, not mere key presence`)
+    assert.deepEqual(capOrphan(sp), [], 'integrate is bounded in this clone, so the key is not dead overlay')
+  }
+
+  const good = cloneSpec(spec())
+  mget(good.steps, 'integrate').next.set('cap-exhausted', 'escalate')
+  good.binding.caps['integrate.retry'] = 2
+  assert.deepEqual(capMissing(good), [], 'a valid owned key does satisfy Arm B')
+})
+
 await test('F2.17: structural — the derived requirement set is exactly the declared binding (9 keys)', () => {
   const derived = requiredCapKeys(spec())
   assert.equal(derived.length, 9, 'nine holds only under E11’s revised rule; the literal-loop: rule yields eight')
@@ -965,8 +1066,15 @@ const JQ_WS_REJECTED = [
   ['U+202F', cp(0x202f)], ['U+205F', cp(0x205f)], ['U+3000', cp(0x3000)],
 ]
 const C2_WS_ACCEPTED = JQ_WS_ACCEPTED.map(([n, c]) => [`B accepted whitespace ${n} + "8"`, item(c + '8')])
+// jq's whitespace class is accepted on BOTH sides of the number. Every row above
+// places the codepoint before the digits, so a mirror grammar that anchors the
+// trailing edge at `$` instead of `[ws]*$` passes them all while failing closed on
+// a value the hook admits — the strict direction, but still a divergence.
+const C2_WS_ACCEPTED_TRAIL = JQ_WS_ACCEPTED.map(([n, c]) => [`B accepted whitespace "8" + ${n} (TRAILING position)`, item('8' + c)])
 const C2_WS = [
   ...C2_WS_ACCEPTED,
+  ...C2_WS_ACCEPTED_TRAIL,
+  ...JQ_WS_REJECTED.map(([n, c]) => [`B rejected whitespace "8" + ${n} (TRAILING position)`, item('8' + c)]),
   ...JQ_WS_REJECTED.map(([n, c]) => [`B rejected whitespace ${n} + "8" (JS trim() strips it)`, item(c + '8')]),
   ['B position: multiple leading whitespace "  8"', item('  8')],
   ['B position: inner whitespace "8 8"', item('8 8')],
@@ -1073,9 +1181,9 @@ for (const [label, scores] of RESIDUAL_C2) {
 
 // ---- AC-F1.3: the safety invariant, over every row (E5) ------------------------
 
-await test('AC-F1.3 safety invariant (E5): the mirror never passes where the oracle does not, over all 66 differential + residual inputs', () => {
+await test('AC-F1.3 safety invariant (E5): the mirror never passes where the oracle does not, over all 81 differential + residual inputs', () => {
   const corpus = [...DIFFERENTIAL_C2, ...RESIDUAL_C2]
-  assert.equal(corpus.length, 66, 'the invariant is only as strong as the corpus it runs over')
+  assert.equal(corpus.length, 81, 'the invariant is only as strong as the corpus it runs over')
   for (const [label, scores] of corpus) {
     const h = hookOutcome(scores)
     const m = mirrorOutcome(scores)
@@ -1119,8 +1227,8 @@ await test('AC-F1.4d: the offending entry is deterministic (first in Object.entr
 })
 
 await test('AC-F1.4e: the verdict shape is unchanged on every accepting item-path row', () => {
-  const accepting = [...C2_GRAMMAR, ...C2_WS_ACCEPTED, ['B position "  8"', item('  8')]]
-  assert.equal(accepting.length, 17)
+  const accepting = [...C2_GRAMMAR, ...C2_WS_ACCEPTED, ...C2_WS_ACCEPTED_TRAIL, ['B position "  8"', item('  8')]]
+  assert.equal(accepting.length, 21)
   for (const [label, scores] of accepting) {
     const v = GATE.computeVerdict(scores)
     assert.deepEqual(Object.keys(v).sort(), [...HOOK_FIELDS, 'below7'].sort(), `${label}: verdict shape changed`)
@@ -1132,6 +1240,37 @@ await test('AC-F1.4f: the injected-thresholds seam still governs all three compa
   assert.equal(strict.pass, false, 'thresholds must be a parameter, not a hard-coded constant')
 })
 
+await test('AC-F1.4g: the finite / -0 reject applies to the COERCED value, so a RAW number is not waved through (E4)', () => {
+  // Not reachable through hookOutcome: the differential harness transmits the
+  // state as JSON, and JSON.stringify maps NaN/±Infinity to null and -0 to 0, so
+  // no oracle-comparable row can carry a raw non-finite number. The mirror's own
+  // API accepts one directly, and E4 states the reject is applied to the coerced
+  // value — which means the number branch must reach the same guard the string
+  // branch does, not return early.
+  for (const [label, v] of [['-0', -0], ['NaN', NaN], ['Infinity', Infinity], ['-Infinity', -Infinity]]) {
+    assert.throws(
+      () => GATE.computeVerdict({ a: v, b: 9 }),
+      (e) => e.code === 'scores-not-evaluable' && e.key === 'a',
+      `bare ${label}: a raw number must fail closed exactly as its string spelling does`,
+    )
+    assert.throws(
+      () => GATE.computeVerdict({ a: { score: v }, b: 9 }),
+      (e) => e.code === 'scores-not-evaluable' && e.key === 'a',
+      `{score: ${label}}: the unwrapped shape must reach the same guard`,
+    )
+  }
+  assert.equal(GATE.computeVerdict({ a: 0, b: 9 }).min, 0, 'positive zero is in the domain and must NOT be rejected')
+})
+
+await test('AC-F1.4h: the thrown error message identifies the offending entry and states the fail-closed posture', () => {
+  assert.throws(() => GATE.computeVerdict({ a: 8, b: 'abc' }), (e) => {
+    assert.match(e.message, /not evaluable/, 'the message is the operator-facing explanation of a hard block')
+    assert.match(e.message, /failing closed/)
+    assert.ok(e.message.includes('scores["b"]'), `the message must name the offending entry: ${e.message}`)
+    return true
+  })
+})
+
 // ---- AC-F1.5: engine/replay.mjs containment (E7) ------------------------------
 
 await test('AC-F1.5a: a corrupt items object in one record does not suppress the other records findings', () => {
@@ -1141,6 +1280,59 @@ await test('AC-F1.5a: a corrupt items object in one record does not suppress the
   assert.doesNotThrow(() => { f = REPLAY.replay(spec(), [corrupt, mismatch]) }, 'a throw here inverts "report, never reconcile" into "crash, report nothing" (D16)')
   assert.ok(f.some((x) => x.where === '#corrupt'), 'the corrupt record must produce a finding of its own')
   assert.ok(f.some((x) => x.code === 'avg-mismatch' && x.where === '#mismatch'), 'the later record’s finding must survive the earlier record’s corruption')
+})
+
+await test('AC-F1.5d: the items-not-evaluable finding is pinned in full, as AC3.6/D18 pins the other four codes', () => {
+  // AC-F1.5a asserts only `where`, which leaves every field a consumer keys on
+  // (`code`, `severity`, `metric`, `actual`, `expected`, `message`) free. A single
+  // deep-equal is the same contract the other finding classes already carry.
+  const corrupt = { issue: '#corrupt', gates: { g: { items: { a: 8, b: 'abc' } } } }
+  assert.deepEqual(REPLAY.replay(spec(), [corrupt]), [{
+    code: 'items-not-evaluable',
+    severity: 'error',
+    where: '#corrupt',
+    metric: 'gates.g.items',
+    actual: '"abc"',
+    expected: 'a value the gate calculator can evaluate',
+    message: '#corrupt/g: item "b" is not evaluable by the gate calculator; this gate object was skipped',
+  }])
+})
+
+await test('AC-F1.5e: `actual` is the JSON rendering of the offending value, and each non-evaluable gate object reports once', () => {
+  // `JSON.stringify` rather than `String`: it is what keeps "abc" distinguishable
+  // from abc, [] from "", and {} from [object Object] in the report.
+  for (const [value, actual] of [['abc', '"abc"'], ['', '""'], [null, 'null'], [true, 'true'], [[], '[]'], [{}, '{}']]) {
+    const rec = { issue: '#c', gates: { g: { items: { a: value } } } }
+    const f = REPLAY.replay(spec(), [rec])
+    assert.equal(f.length, 1, `${JSON.stringify(value)}: expected exactly one finding`)
+    assert.equal(f[0].actual, actual, `${JSON.stringify(value)}: the offending value must be rendered as JSON`)
+  }
+  const two = { issue: '#c', gates: { g: { items: { a: 'abc' } }, h: { items: { a: 'def' } } } }
+  const f = REPLAY.replay(spec(), [two])
+  assert.deepEqual(f.map((x) => x.metric), ['gates.g.items', 'gates.h.items'], 'the metric names the gate object, so two corrupt gates are two distinguishable rows')
+})
+
+await test('AC-F1.5f: the skipped gate object is skipped ENTIRELY — the avg/below7/pass comparisons never see the missing verdict', () => {
+  // The `continue` after the push is load-bearing only when the same gate object
+  // also carries replayable fields; AC-F1.5a's fixture carries `items` alone, so
+  // nothing downstream reads the verdict that was never produced.
+  const rec = { issue: '#corrupt', gates: { g: { items: { a: 'abc' }, avg: 8.5, below7: ['a'], pass: true } } }
+  let f
+  assert.doesNotThrow(() => { f = REPLAY.replay(spec(), [rec]) }, 'falling through to the avg comparison dereferences a verdict that was never computed')
+  assert.deepEqual(f.map((x) => x.code), ['items-not-evaluable'], 'a gate object the calculator refused is reported once and not additionally diffed')
+})
+
+await test('AC-F1.5g: only the typed non-evaluability signal is contained — any other error propagates', () => {
+  // A blanket catch would turn a genuine engine bug into an "items-not-evaluable"
+  // finding, i.e. into evidence that the digest is at fault.
+  const items = {}
+  Object.defineProperty(items, 'a', { enumerable: true, get() { throw new RangeError('engine bug, not a corrupt digest') } })
+  const rec = { issue: '#boom', gates: { g: { items } } }
+  assert.throws(
+    () => REPLAY.replay(spec(), [rec]),
+    (e) => e instanceof RangeError && !(e instanceof GATE.ScoresNotEvaluableError),
+    'a non-typed error must reach the caller instead of being relabelled as a digest finding',
+  )
 })
 
 await test('AC-F1.5b: the real corpus replay is unaffected — full deep-equality against the pre-change fixture', () => {
