@@ -6,15 +6,46 @@
 // negative case without mutating spec/ (D10). Findings are reported, never
 // reconciled (§2.4) — and both cap directions are checked so the lint cannot
 // degenerate into "only the caps someone remembered to wire".
-import { RESERVED } from './routing.mjs'
+import { RESERVED, CAP_EDGES, CAP_LOOPS } from './routing.mjs'
 
 const isBounded = (step) => !!step.loop || step.next.has('cap-exhausted')
+
+const capValid = (caps, key) => Number.isInteger(caps[key]) && caps[key] >= 1
+
+// The required caps are per EDGE, not per owner (E8): `handoff` declares one
+// `cap-exhausted` outcome but owns two cap keys, so the spec alone cannot express
+// "two required caps" — the routing table is the only place the split is declared
+// (engine/routing.mjs:31-32, D20/L13). A row applies only if the spec still
+// declares its step and its outcome (E11), so a mutated clone raises no phantom;
+// for a CAP_LOOPS row the step-side test is `isBounded`, NOT a literal `loop:`
+// block — `refine` carries a CAP_LOOPS row and is bounded through `cap-exhausted`.
+// Requirements deduplicate by cap key, which is what preserves D20's shared
+// counters (`verify.round-trips`, `gate_plan.retry`).
+function requiredCaps(spec) {
+  const keys = new Set()
+  const steps = new Set()
+  for (const [k, row] of Object.entries(CAP_EDGES)) {
+    const at = k.indexOf(':')
+    const step = spec.steps.get(k.slice(0, at))
+    if (!step || !step.next.has(k.slice(at + 1))) continue
+    keys.add(row.capKey)
+    steps.add(k.slice(0, at))
+  }
+  for (const [id, row] of Object.entries(CAP_LOOPS)) {
+    const step = spec.steps.get(id)
+    if (!step || !isBounded(step)) continue
+    keys.add(row.capKey)
+    steps.add(id)
+  }
+  return { keys, steps }
+}
 
 export function lint(spec) {
   const findings = []
   const stepIds = new Set(spec.steps.keys())
   const roleIds = new Set(spec.roles.keys())
   const caps = spec.binding.caps || {}
+  const required = requiredCaps(spec)
 
   // Bucket cap keys by owner (the segment before the first `.`) once, so check 4
   // below is a single lookup per step instead of a full re-scan of `caps`.
@@ -99,9 +130,12 @@ export function lint(spec) {
       }
     }
 
-    // 4 — every bounded step owns at least one integer cap key in the binding.
-    if (isBounded(step)) {
-      const owned = (capsByOwner.get(id) || []).filter((k) => Number.isInteger(caps[k]) && caps[k] >= 1)
+    // 4, Arm B — fallback for a bounded step that no applying table row names, so
+    // a step declared bounded but absent from the routing tables is still reported
+    // (E9) and `isBounded` (D1) stays a live input to the lint. Mutually exclusive
+    // with Arm A below, so the two never double-report (E10).
+    if (isBounded(step) && !required.steps.has(id)) {
+      const owned = (capsByOwner.get(id) || []).filter((k) => capValid(caps, k))
       if (owned.length === 0) {
         findings.push({
           code: 'cap-missing',
@@ -114,6 +148,22 @@ export function lint(spec) {
         })
       }
     }
+  }
+
+  // 4, Arm A — every required cap key is declared with an integer value ≥ 1 (E13),
+  // checked per key rather than per owner: that is what makes
+  // `handoff.review-response = 0` reportable while `handoff.env-retry = 2` is valid.
+  for (const key of required.keys) {
+    if (capValid(caps, key)) continue
+    findings.push({
+      code: 'cap-missing',
+      severity: 'error',
+      where: key,
+      step: key.split('.')[0],
+      message: `bounded edge cap key "${key}" is not declared with an integer value ≥ 1 in the binding`,
+      expected: `a binding cap key "${key}" with an integer value ≥ 1`,
+      actual: key in caps ? JSON.stringify(caps[key]) : 'none',
+    })
   }
 
   // 5 — the reverse direction: no cap key is dead overlay.

@@ -15,7 +15,7 @@
 // `pass` is replayed against the HOOK formula (D4), not the emitter's weaker
 // `below7|length == 0`; today's 13 records yield 0 divergences, which is a
 // coincidence of the corpus, not equivalence evidence.
-import { computeVerdict, round1 } from './gate.mjs'
+import { computeVerdict, round1, ScoresNotEvaluableError } from './gate.mjs'
 import { capValue } from './routing.mjs'
 
 const DIGEST = 'docs/cycle-digest.jsonl'
@@ -90,8 +90,28 @@ export function replay(spec, records) {
       // A verdict-shaped gate object ("skipped (feat issue)" / "not-evaluated")
       // carries no scores: not applicable, never a finding and never a throw.
       if (!gate || !gate.items) continue
-      const verdict = computeVerdict(gate.items)
       const where = rec.issue
+
+      // D16 again (E7): `computeVerdict` now throws on an entry the gate calculator
+      // refuses to evaluate. Letting it escape would suppress every other record's
+      // findings — "crash, report nothing" instead of "report, never reconcile" —
+      // so the record is reported and the walk continues.
+      let verdict
+      try {
+        verdict = computeVerdict(gate.items)
+      } catch (e) {
+        if (!(e instanceof ScoresNotEvaluableError)) throw e
+        findings.push({
+          code: 'items-not-evaluable',
+          severity: 'error',
+          where,
+          metric: `gates.${name}.items`,
+          actual: JSON.stringify(e.value),
+          expected: 'a value the gate calculator can evaluate',
+          message: `${where}/${name}: item "${e.key}" is not evaluable by the gate calculator; this gate object was skipped`,
+        })
+        continue
+      }
 
       if (typeof gate.avg === 'number') {
         if (gate.avg !== round1(gate.avg)) roundingDivergence = true
