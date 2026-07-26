@@ -191,6 +191,15 @@ await test('parser 9: value beginning with "." and value containing "{}"', () =>
   })
 })
 
+await test('parser 10: a block sequence whose entries are nested block maps parses as an array of objects', () => {
+  // No spec/**/*.yaml uses this shape today, so the branch is only reachable
+  // synthetically; it is part of the declared subset ("block sequences", nested by
+  // indentation — spec-load.mjs:10) and a silent mis-parse of it would be exactly
+  // the failure mode the strict parser exists to prevent.
+  const v = P('checks:\n  -\n    id: a\n    cap: 6\n  -\n    id: b\n    cap: 7\n')
+  assert.deepEqual(v, { checks: [{ id: 'a', cap: 6 }, { id: 'b', cap: 7 }] })
+})
+
 // Strict-subset guard [MUST] — a construct outside the subset throws, never guesses.
 const REJECTIONS = [
   ['anchor / alias', 'base: &a\n  x: 1\nother: *a\n', 1],
@@ -199,6 +208,15 @@ const REJECTIONS = [
   ['multi-document marker', '---\nstep: a\n---\nstep: b\n', 1],
   ['tab indentation', 'next:\n\tpass: green\n', 2],
   ['nested flow collection', 'x: [a, [b, c]]\n', 1],
+  // The guard is stated over the whole class — "any construct outside this list …
+  // throws" (verification design :169) — not over the six named examples, so the
+  // remaining rejection sites carry a case each. Synthetic inputs: no spec/**/*.yaml
+  // can reach them (a spec file that did would fail to load).
+  ['unterminated flow collection', 'requires: [issue, cycle-state\n', 1],
+  ['flow-map entry with no ":"', 'dev: { provider claude, model opus }\n', 1],
+  ['continuation line after a flow collection', 'requires: [issue, cycle-state]\n  folded-tail\n', 2],
+  ['a line inside a mapping that is not a key', 'step: diagnose\nnot a key line\n', 2],
+  ['unexpected indentation after the root block', '  step: diagnose\nnext: green\n', 2],
 ]
 for (const [label, text, line] of REJECTIONS) {
   await test(`parser strict-subset: ${label} throws with the offending line number`, () => {
@@ -283,6 +301,51 @@ await test('AC1.3 negative: a gate whose agents omits evaluator yields a finding
   const f = LINT.lint(sp).filter((x) => x.code === 'gate-incomplete' || x.code === 'agent-undeclared')
   assert.ok(codes(f, 'gate-incomplete').length >= 1, 'missing evaluator must be reported per missing part')
   assert.ok(JSON.stringify(f).includes('audit'))
+})
+
+await test('AC1.3 negative: an EMPTY criteria string is a finding, not a satisfied gate', () => {
+  const sp = cloneSpec(spec())
+  mget(sp.steps, 'gate_plan').criteria = ''
+  const f = codes(LINT.lint(sp), 'gate-incomplete')
+  assert.equal(f.length, 1)
+  assert.equal(f[0].where, 'gate_plan.criteria')
+  assert.equal(f[0].expected, 'a non-empty criteria name')
+  assert.equal(f[0].actual, '', 'the finding reports the offending value, distinguishing "" from "absent"')
+})
+
+// AC1.3's third obligation: naming `evaluator` is not enough — the referenced role
+// must itself declare `session: fresh` (invariant 2; feature design §1.4). A gate
+// whose evaluator is reused is not a gate, so the reference check and the property
+// check are separate negatives.
+const GATE_STEPS = ['audit', 'gate_hypothesis', 'gate_plan', 'gate_quality']
+
+await test('AC1.3: the four kind:gate steps are the ones the evaluator invariant applies to', () => {
+  const sp = spec()
+  const gates = mkeys(sp.steps).filter((id) => stepOf(sp, id).kind === 'gate').sort()
+  assert.deepEqual(gates, GATE_STEPS)
+  assert.equal(mget(sp.roles, 'evaluator').session, 'fresh', 'invariant 2 holds on the real tree')
+})
+
+await test('AC1.3 negative: an evaluator role declaring session other than fresh yields one gate-incomplete per gate', () => {
+  const sp = cloneSpec(spec())
+  mget(sp.roles, 'evaluator').session = 'persistent'
+  const f = codes(LINT.lint(sp), 'gate-incomplete')
+  assert.equal(f.length, GATE_STEPS.length, 'a reused evaluator invalidates every gate, not just one')
+  assert.deepEqual(f.map((x) => x.step).sort(), GATE_STEPS)
+  for (const hit of f) {
+    assert.equal(hit.severity, 'error')
+    assert.equal(hit.where, `${hit.step}.agents.evaluator`)
+    assert.equal(hit.expected, 'session: fresh')
+    assert.equal(hit.actual, 'persistent', 'the finding must report the offending session value')
+  }
+})
+
+await test('AC1.3 negative: a gate naming evaluator while the role is undeclared is reported, not treated as satisfied', () => {
+  const sp = cloneSpec(spec())
+  sp.roles.delete('evaluator')
+  const f = codes(LINT.lint(sp), 'gate-incomplete')
+  assert.equal(f.length, GATE_STEPS.length)
+  for (const hit of f) assert.equal(hit.actual, 'role absent')
 })
 
 await test('AC1.4 negative: a bounded step owning no cap key yields one cap-missing finding', () => {
@@ -1151,6 +1214,13 @@ await test('U-3 direct call: resolve() throws on an undeclared outcome', () => {
   assert.deepEqual(RT.resolve(spec(), 'red', 'red-confirmed'), { target: 'green', reserved: false })
 })
 
+await test('U-3 direct call: resolve() throws on an undeclared STEP, naming it', () => {
+  // The step arm and the outcome arm are separate guards: a resolve() that returned
+  // undefined for an unknown step would make every simulator hop silently vacuous.
+  assert.throws(() => RT.resolve(spec(), 'no-such-step', 'pass'), /no-such-step/)
+  assert.throws(() => RT.resolve(spec(), '', 'pass'))
+})
+
 await test('U-3 direct call: reachable() and backEdges() operate on the spec model alone', () => {
   const sp = spec()
   const from = RT.reachable(sp, 'deliver')
@@ -1338,6 +1408,130 @@ await test('AC3/D16: parsing continues past a malformed line — the other 13 re
   const { records } = REPLAY.parseDigest(`${lines.join('\n')}\n`)
   assert.equal(records.length, 13, 'a throw would suppress the other records and invert "report, never reconcile"')
   assert.equal(REPLAY.replay(spec(), records).length, 4)
+})
+
+// ---- AC3.2 mismatch families, driven synthetically ------------------------------
+//
+// AC3.2's contract is "every mismatch reported as a finding, never silently
+// reconciled". The checked-in 13-record corpus produces NONE of the three mismatch
+// codes — AC3.7 / AC3.7b / AC3.7-D4 above assert their absence — so on the real
+// corpus alone the three emitters are unobservable and the contract is discharged
+// only structurally (no write API). These cases supply the positive direction with
+// records built to the emitter's own pass-shape `{pass, avg, items, below7}`
+// (scripts/handoff/emit-cycle-digest.sh:157-160), asserting the exact tuple the way
+// AC3.3-AC3.5 do for cap-exceeded.
+const synthRecord = (issue, gates) => ({
+  issue,
+  terminal_cycle: 1,
+  date: '2026-01-01',
+  mode: 'new-issue',
+  gates,
+  regressions: { gate_plan: 0, verify: 0, audit: 0, gate_quality: 0, review_autofix_cycles: 0 },
+  architect: { rounds: 0, escalate: false },
+})
+// Every synthetic avg below is already at 1 dp, so the corpus-wide DCR-2 warn does
+// not fire and the expected finding set of each case is exactly the mismatch(es).
+const only = (rec) => REPLAY.replay(spec(), [rec])
+
+await test('AC3.2 avg-mismatch: a recorded avg that does not reproduce at 1 dp is reported as an exact tuple', () => {
+  const items = { feasibility: 8, dependencies: 8, scope: 8 }
+  const rec = synthRecord('#901', { gate_plan: { pass: true, avg: 9.9, items, below7: [] } })
+  const f = only(rec)
+  assert.equal(f.length, 1, `expected exactly the avg-mismatch, got ${JSON.stringify(f)}`)
+  assert.equal(f[0].code, 'avg-mismatch')
+  assert.equal(f[0].severity, 'error')
+  assert.equal(f[0].where, '#901')
+  assert.equal(f[0].metric, 'gates.gate_plan.avg')
+  assert.equal(f[0].actual, 9.9, 'the finding must carry the RECORDED value')
+  assert.equal(round1(f[0].expected), round1(GATE.computeVerdict(items).avg), 'and the calculator value it failed to reproduce')
+})
+
+await test('AC3.2/DCR-2: a sub-1-dp avg difference is absorbed — the policy warn, never an avg-mismatch', () => {
+  // The corpus shape: emit-cycle-digest.sh:158 writes the unrounded add/length.
+  const rec = synthRecord('#902', {
+    gate_hypothesis_cause: { pass: true, avg: 9.333333333333334, items: { a: 9, b: 10, c: 9 }, below7: [] },
+  })
+  const f = only(rec)
+  assert.deepEqual(codes(f, 'avg-mismatch'), [], 'the 1-dp rule is what keeps the known policy difference out of the mismatch class')
+  assert.deepEqual(sortIds(f), sortIds([{ severity: 'warn', code: 'avg-rounding-policy-divergence', where: 'corpus' }]))
+})
+
+await test('AC3.2 below7-mismatch: a recorded below7 set that does not reproduce is reported as an exact tuple', () => {
+  const items = { feasibility: 6, dependencies: 5, scope: 9 }
+  const v = GATE.computeVerdict(items)
+  const rec = synthRecord('#903', { gate_plan: { pass: false, avg: v.avg, items, below7: ['feasibility'] } })
+  const f = only(rec)
+  assert.equal(f.length, 1, `expected exactly the below7-mismatch, got ${JSON.stringify(f)}`)
+  assert.equal(f[0].code, 'below7-mismatch')
+  assert.equal(f[0].severity, 'error')
+  assert.equal(f[0].where, '#903')
+  assert.equal(f[0].metric, 'gates.gate_plan.below7')
+  assert.deepEqual(f[0].actual.slice().sort(), ['feasibility'])
+  assert.deepEqual(f[0].expected.slice().sort(), ['dependencies', 'feasibility'], 'a dropped below-7 item is a real set difference')
+})
+
+await test('AC3.2/D21: a below7 recorded in the emitter\'s to_entries order is NOT a mismatch (order-insensitive)', () => {
+  const items = { feasibility: 6, dependencies: 5, scope: 9 }
+  const v = GATE.computeVerdict(items)
+  assert.deepEqual(v.below7, ['dependencies', 'feasibility'], 'the calculator returns it sorted (§1.5)')
+  const rec = synthRecord('#904', { gate_plan: { pass: false, avg: v.avg, items, below7: ['feasibility', 'dependencies'] } })
+  assert.deepEqual(only(rec), [], 'raw-array comparison would turn insertion order into a spurious finding')
+})
+
+await test('AC3.2/DCR-3 pass-mismatch: the avg floor discriminates the hook oracle from the emitter formula', () => {
+  // items all ≥ 7 → the emitter's `below7|length == 0` says pass; the hook's avg
+  // floor (7.0 < 7.5) says fail. The corpus cannot produce this record; without it
+  // "0 pass divergences today" is asserted against an emitter-equivalent oracle.
+  const items = { feasibility: 7, dependencies: 7, scope: 7 }
+  const v = GATE.computeVerdict(items)
+  assert.equal(v.pass, false)
+  assert.equal(v.below7.length, 0, 'the emitter formula would record pass:true here')
+  const rec = synthRecord('#905', { gate_plan: { pass: true, avg: v.avg, items, below7: [] } })
+  const f = only(rec)
+  assert.equal(f.length, 1, `expected exactly the pass-mismatch, got ${JSON.stringify(f)}`)
+  assert.equal(f[0].code, 'pass-mismatch')
+  assert.equal(f[0].severity, 'error')
+  assert.equal(f[0].where, '#905')
+  assert.equal(f[0].metric, 'gates.gate_plan.pass')
+  assert.equal(f[0].actual, true)
+  assert.equal(f[0].expected, false)
+})
+
+await test('AC3.2/DCR-3 pass-mismatch: the security-block arm of the oracle also reaches the pass comparison', () => {
+  const items = { command_injection: 9, fixture_data: 9, security: 3 }
+  const v = GATE.computeVerdict(items)
+  assert.equal(v.pass, false)
+  assert.equal(v.security, 3, 'the security ≤ 3 rule takes precedence over the item and avg rules')
+  // below7/avg are recorded faithfully here, so the pass field is the only divergence.
+  const rec = synthRecord('#906', { audit: { pass: true, avg: v.avg, items, below7: v.below7 } })
+  const f = only(rec)
+  assert.equal(f.length, 1, `expected exactly the pass-mismatch, got ${JSON.stringify(f)}`)
+  assert.equal(f[0].code, 'pass-mismatch')
+  assert.equal(f[0].metric, 'gates.audit.pass')
+  assert.equal(f[0].expected, false)
+})
+
+await test('AC3.2: a record diverging on all three fields yields all three findings — none masks another', () => {
+  const items = { feasibility: 6, dependencies: 5, scope: 9 }
+  const rec = synthRecord('#907', { gate_plan: { pass: true, avg: 9.9, items, below7: [] } })
+  const f = only(rec)
+  assert.deepEqual(
+    f.map((x) => x.code).sort(),
+    ['avg-mismatch', 'below7-mismatch', 'pass-mismatch'],
+    'the three checks are independent; an early return would silently reconcile the rest',
+  )
+  for (const x of f) assert.equal(x.where, '#907')
+})
+
+await test('AC3.2 behavioral: replay() reconciles nothing — the input records are byte-identical afterwards', () => {
+  const rec = synthRecord('#908', {
+    gate_plan: { pass: true, avg: 9.9, items: { feasibility: 6, dependencies: 5, scope: 9 }, below7: [] },
+  })
+  const records = [rec, ...parsed().records]
+  const before = JSON.stringify(records)
+  const f = REPLAY.replay(spec(), records)
+  assert.ok(f.length > 0)
+  assert.equal(JSON.stringify(records), before, 'report-only must hold at runtime, not only as an absent write API')
 })
 
 // ================================================================================
