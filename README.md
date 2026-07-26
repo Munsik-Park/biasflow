@@ -170,6 +170,7 @@ claude-autoflow/
 │   ├── adr/                           # Architecture Decision Records (docs/adr/)
 │   └── phases/                        # Per-phase playbooks (docs/phases/)
 │
+├── engine/                            # Spec simulator modules — lint / routing / gate / replay (engine/)
 ├── plugin/                            # Packaged plugin distribution surface (plugin/)
 ├── scripts/                           # Helper / handoff scripts (scripts/)
 ├── tests/                             # Guard & regression suites (tests/)
