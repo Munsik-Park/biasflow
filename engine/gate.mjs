@@ -86,9 +86,7 @@ export function computeVerdict(scores, thresholds = THRESHOLDS) {
   const vals = pairs.map(([, n]) => n)
   const avg = round1(vals.reduce((a, b) => a + b, 0) / vals.length)
   const min = Math.min(...vals)
-  const rawSec = scores.security !== undefined && scores.security !== null
-    ? scores.security
-    : (scores['보안'] !== undefined && scores['보안'] !== null ? scores['보안'] : null)
+  const rawSec = scores.security ?? scores['보안'] ?? null
   const security = rawSec === null ? null : unwrap(rawSec)
   const below7 = pairs.filter(([, n]) => n < thresholds.itemMin).map(([k]) => k).sort()
 

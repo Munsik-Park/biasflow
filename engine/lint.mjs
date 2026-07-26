@@ -6,7 +6,7 @@
 // negative case without mutating spec/ (D10). Findings are reported, never
 // reconciled (§2.4) — and both cap directions are checked so the lint cannot
 // degenerate into "only the caps someone remembered to wire".
-import { RESERVED, CAP_EDGES, CAP_LOOPS } from './routing.mjs'
+import { RESERVED, CAP_LOOPS, edges, capKeyFor, capKeyForLoop } from './routing.mjs'
 
 const isBounded = (step) => !!step.loop || step.next.has('cap-exhausted')
 
@@ -20,22 +20,21 @@ const capValid = (caps, key) => Number.isInteger(caps[key]) && caps[key] >= 1
 // for a CAP_LOOPS row the step-side test is `isBounded`, NOT a literal `loop:`
 // block — `refine` carries a CAP_LOOPS row and is bounded through `cap-exhausted`.
 // Requirements deduplicate by cap key, which is what preserves D20's shared
-// counters (`verify.round-trips`, `gate_plan.retry`).
+// counters (`verify.round-trips`, `gate_plan.retry`). Resolution reuses
+// routing.mjs's own accessors (`edges`/`capKeyFor`/`capKeyForLoop`) rather than
+// re-parsing the `<step>:<outcome>` table keys by hand.
 function requiredCaps(spec) {
   const keys = new Set()
   const steps = new Set()
-  for (const [k, row] of Object.entries(CAP_EDGES)) {
-    const at = k.indexOf(':')
-    const step = spec.steps.get(k.slice(0, at))
-    if (!step || !step.next.has(k.slice(at + 1))) continue
-    keys.add(row.capKey)
-    steps.add(k.slice(0, at))
+  const mark = (id, capKey) => { keys.add(capKey); steps.add(id) }
+  for (const { step: id, outcome } of edges(spec)) {
+    const capKey = capKeyFor(id, outcome)
+    if (capKey) mark(id, capKey)
   }
-  for (const [id, row] of Object.entries(CAP_LOOPS)) {
+  for (const id of Object.keys(CAP_LOOPS)) {
     const step = spec.steps.get(id)
     if (!step || !isBounded(step)) continue
-    keys.add(row.capKey)
-    steps.add(id)
+    mark(id, capKeyForLoop(id))
   }
   return { keys, steps }
 }
