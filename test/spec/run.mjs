@@ -201,30 +201,47 @@ await test('parser 10: a block sequence whose entries are nested block maps pars
 })
 
 // Strict-subset guard [MUST] — a construct outside the subset throws, never guesses.
+//
+// Fourth column: a fragment the report must name. "Fail-loud is the only safe posture"
+// (verification design :169-173) is a claim about the *diagnosis*, not merely about the
+// exit status — a parser that rejects the input while naming a different construct has
+// not told the operator which line of their declaration is outside the subset. Without
+// this column the table asserts only "something threw carrying that number", which several
+// distinct guards satisfy identically, so an individual guard could be removed and the
+// generic fallback at the end of the root block would absorb the case unnoticed.
+// Each fragment names the *construct* the case feeds, derived from the subset list
+// (verification design :155-173) — not transcribed from a message the engine happens to
+// emit for some other reason.
 const REJECTIONS = [
-  ['anchor / alias', 'base: &a\n  x: 1\nother: *a\n', 1],
-  ['block scalar', 'desc: |\n  a literal block\n', 1],
-  ['quoted key', '"step": diagnose\n', 1],
-  ['multi-document marker', '---\nstep: a\n---\nstep: b\n', 1],
-  ['tab indentation', 'next:\n\tpass: green\n', 2],
-  ['nested flow collection', 'x: [a, [b, c]]\n', 1],
+  ['anchor / alias', 'base: &a\n  x: 1\nother: *a\n', 1, 'anchors and aliases'],
+  ['block scalar', 'desc: |\n  a literal block\n', 1, 'block scalars'],
+  ['quoted key', '"step": diagnose\n', 1, 'quoted keys'],
+  ['multi-document marker', '---\nstep: a\n---\nstep: b\n', 1, 'multi-document markers'],
+  ['tab indentation', 'next:\n\tpass: green\n', 2, 'tab indentation'],
+  ['nested flow collection', 'x: [a, [b, c]]\n', 1, 'nested flow collections'],
   // The guard is stated over the whole class — "any construct outside this list …
   // throws" (verification design :169) — not over the six named examples, so the
   // remaining rejection sites carry a case each. Synthetic inputs: no spec/**/*.yaml
   // can reach them (a spec file that did would fail to load).
-  ['unterminated flow collection', 'requires: [issue, cycle-state\n', 1],
-  ['flow-map entry with no ":"', 'dev: { provider claude, model opus }\n', 1],
-  ['continuation line after a flow collection', 'requires: [issue, cycle-state]\n  folded-tail\n', 2],
-  ['a line inside a mapping that is not a key', 'step: diagnose\nnot a key line\n', 2],
-  ['unexpected indentation after the root block', '  step: diagnose\nnext: green\n', 2],
+  ['unterminated flow collection', 'requires: [issue, cycle-state\n', 1, 'unterminated flow collection'],
+  ['flow-map entry with no ":"', 'dev: { provider claude, model opus }\n', 1, 'not a flow-map entry'],
+  ['continuation line after a flow collection', 'requires: [issue, cycle-state]\n  folded-tail\n', 2, 'continuation line after a flow collection'],
+  ['a line inside a mapping that is not a key', 'step: diagnose\nnot a key line\n', 2, 'not a key line'],
+  ['unexpected indentation after the root block', '  step: diagnose\nnext: green\n', 2, 'unexpected indentation'],
 ]
-for (const [label, text, line] of REJECTIONS) {
-  await test(`parser strict-subset: ${label} throws with the offending line number`, () => {
+for (const [label, text, line, fragment] of REJECTIONS) {
+  await test(`parser strict-subset: ${label} throws naming the construct and the offending line`, () => {
     let thrown = null
     try { P(text, 'reject.yaml') } catch (e) { thrown = e }
     assert.ok(thrown, `expected a throw for ${label}, got a parsed value`)
-    const carries = thrown.line === line || new RegExp(`(^|\\D)${line}(\\D|$)`).test(String(thrown.message))
-    assert.ok(carries, `throw must carry the offending line number ${line}; got: ${thrown.message}`)
+    // Tightened from `thrown.line === line || <the message contains the digits>`: the
+    // disjunct let a throw whose message merely happened to contain the digit pass even
+    // when the reported line was wrong. The structured field is the contract.
+    assert.equal(thrown.line, line, `throw must report the offending line ${line}; got: ${thrown.message}`)
+    assert.ok(
+      String(thrown.message).includes(fragment),
+      `throw must name the rejected construct (${fragment}); got: ${thrown.message}`,
+    )
   })
 }
 
@@ -933,6 +950,26 @@ await test('R6: refine.retry is counted through the STEP-keyed CAP_LOOPS lookup'
   assert.equal(RT.capKeyForLoop('architect'), 'architect.loop')
   assert.equal(RT.capKeyFor('refine', 'green-reconfirmed'), null, 'refine closes no cycle — it is a loop bound, not an edge bound')
   assert.equal(RT.capKeyFor('architect', 'converged'), null)
+})
+
+await test('R6: capKeyForLoop resolves to no cap key for a step that declares no loop bound', () => {
+  // D1/D11 (feature design :130, :169): a step is bounded iff it declares a `loop:` block
+  // or a `cap-exhausted` outcome, and CAP_LOOPS keys only the *loop*-bounded steps. A step
+  // outside that table must resolve to no loop cap key — under D20 the counters map is keyed
+  // by cap key, so a non-loop step resolving to one would silently draw down that step's
+  // budget. Asserted here on capKeyForLoop alone: its miss arm is byte-identical to
+  // capKeyFor's, and the sibling assertions above (`capKeyFor(...) === null`) cannot
+  // discriminate this one.
+  const sp = spec()
+  const loopBounded = new Set(Object.keys(RT.CAP_LOOPS))
+  assert.deepEqual([...loopBounded].sort(), ['architect', 'refine'])
+  for (const id of mkeys(sp.steps)) {
+    if (loopBounded.has(id)) continue
+    assert.equal(RT.capKeyForLoop(id), null, `${id} declares no loop bound — it must resolve to no loop cap key`)
+  }
+  // Named explicitly so the property is not vacuous if CAP_LOOPS ever grows:
+  assert.equal(RT.capKeyForLoop('diagnose'), null)
+  assert.equal(RT.capKeyForLoop('gate_plan'), null, 'gate_plan is edge-bounded, not loop-bounded')
 })
 
 await test('R6: the loop counters are distinct from every CAP_EDGES counter', () => {
