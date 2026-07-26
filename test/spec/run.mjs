@@ -1597,7 +1597,9 @@ await test('AC4.1/AC4.2 proxy: the spec-simulator workflow exists, carries the S
   assert.ok(existsSync(join(root, WF)), `${WF} does not exist`)
   const t = wfText()
   assert.match(t, /SPDX-FileCopyrightText: 2026 Munsik-Park/)
-  assert.match(t, /SPDX-License-Identifier: Elastic-2\.0/)
+  // Composed (not a contiguous literal) so REUSE's SPDX-tag scanner does not
+  // parse this regex source as an SPDX License Expression itself.
+  assert.match(t, new RegExp('SPDX-License-' + 'Identifier: Elastic-2\\.0'))
   assert.match(t, /^name: .+$/m)
   assert.match(t, /runs-on: ubuntu-latest/)
 })
