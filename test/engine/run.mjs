@@ -26,6 +26,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync, readdirSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
@@ -308,6 +309,13 @@ function artifactsMap(sp) {
 }
 
 function delegationOutputFor(sp, stepId, wanted, opts = {}) {
+  // Trap D (cycle 3, measured at RED). A pending step id the spec does not carry —
+  // `undefined` from the reviewer's `pending: {}` witness — makes stepOf() throw HERE,
+  // before advance() has been called, so the harness reports its own lookup failure as
+  // the document's consequence. Handing the delegation through unresolved lets the
+  // ENGINE raise its own error at its own trust boundary, which is the thing under
+  // test. No existing caller reaches this branch: every other case names a real step.
+  if (!mhas(sp.steps, stepId)) return { outcome: wanted }
   if (stepId === 'handoff') {
     return { max_severity: opts.maxSeverity || 'Medium', findings: [], low_confidence_items: [] }
   }
@@ -2006,6 +2014,834 @@ await test('E4.20/AC4 (cycle 2): the rejection message reports the field and its
 })
 
 // ================================================================================
+// GROUP 4 (cycle 3) — the STATED contract, and its deliberately unenforced half
+// ================================================================================
+//
+// Authored from .autoflow/issue-4-verification-design.md (cycle 3) §2/§3 and the
+// acceptance criterion .autoflow/issue-4-c3-acceptance-criterion.md, before the
+// implementation — not from it. Cycle 1 closed a missing skeleton check, cycle 2 a
+// missing field-TYPE check, and each closed one witness. The complaint class did not
+// terminate, because engine/run-state.mjs states no criterion for where admission
+// STOPS: with nothing written down, one more unvalidated shape can always be named.
+//
+// The rule this cycle ships (feature design §1.1), transcribed here so a reader of
+// the suite finds the criterion beside the cases that enforce it:
+//
+//   A persisted state document is admitted iff every value the engine will ACT ON
+//   after reading it back has the type that action requires.
+//     R1 — enforce what is dereferenced, used as a key/index, spread, or counted on.
+//     R2 — stop at pass-through: a value only carried into an event, a notify record
+//          or history cannot crash the executor and cannot forge a budget.
+//     R3 — types and shapes, never value domains: "is this a string?" is a document
+//          property; "is this a spec step id?" is the document's agreement with a
+//          spec the loader does not hold.
+//
+// Both halves are held here, and the second half is the one that makes this a
+// contract rather than a patch. The ENFORCED half is E4.21/E4.21b/E4.25/E4.29. The
+// UNENFORCED half is E4.24(ii)/(iii) and E4.27: if a path STATE_UNENFORCED declares
+// open silently BECAME enforced, those cases go red. A declaration whose "we
+// deliberately do not check X" is untested is documentation, not a contract.
+//
+// Oracle discipline is cycle 2's, extended to depth (verification §3.4). The
+// declaration supplies INPUTS and names the partition under test; it never supplies
+// an expectation. No case reads `.ok` or `.expected`, no case reads a fixture's own
+// `.ok`/`.expected` verdict field, and the nested refusal phrase is PROSE_SOURCED
+// from feature design §4.3 rather than read off the table it is asserted against.
+//
+// Housekeeping (GATE:PLAN cycle-3 carry condition 5): verification §2's superseded
+// three-bucket "Method" sentence is NOT transcribed anywhere below. The classifier
+// implements the binding five-bucket partition of §2/§3.1 only.
+
+// The three clause ids the rule defines. Authored from feature design §1.1, so a row
+// carrying an invented clause fails rather than being absorbed.
+const CLAUSES = Object.freeze(['R1', 'R2', 'R3'])
+
+// ---- the generated corpus (verification design §3.1, rejection side) -----------
+//
+// 14 paths x 7 witness forms = 98 rows. The eight top-level paths come from
+// fieldKeys() — derived from a document a real run persisted, NOT from the engine's
+// table — and the six nested paths are authored from §0.1's consumption table. The
+// nested six are authored on purpose: a generator that shrank with the declaration
+// could never witness a path the declaration forgot.
+const NESTED_PROBE_PATHS = Object.freeze([
+  'halt.detail', 'halt.reason', 'halt.step',
+  'pending.request', 'pending.roles', 'pending.step',
+])
+const ABSENT = Symbol('absent')
+const WITNESS_FORMS = Object.freeze([...WITNESSES, ABSENT])
+const witnessWord = (w) => (w === ABSENT ? 'absent' : tagOf(w))
+
+// Parent containers a real run persists (engine/flow.mjs:232 for `pending`,
+// engine/flow.mjs:271 for `halt`), so a nested witness perturbs an otherwise
+// legitimate document rather than one this case invented.
+const delegatingDoc = () => ({
+  ...goodDoc(), step: 'gate_plan', status: 'delegating',
+  pending: { step: 'gate_plan', roles: ['evaluator'], request: { role: 'evaluator' } },
+})
+const haltedDoc = () => ({
+  ...goodDoc(), step: 'validate', status: 'halted',
+  halt: { reason: 'incomplete', step: 'validate', detail: null },
+})
+
+const baseFor = (path) => (path.startsWith('pending.') ? delegatingDoc()
+  : path.startsWith('halt.') ? haltedDoc() : goodDoc())
+
+function placeWitness(path, witness) {
+  const doc = baseFor(path)
+  const seg = path.split('.')
+  const container = seg.length === 1 ? doc : doc[seg[0]]
+  const leaf = seg[seg.length - 1]
+  if (witness === ABSENT) delete container[leaf]
+  else container[leaf] = witness
+  return doc
+}
+
+const corpusPaths = () => [...fieldKeys(), ...NESTED_PROBE_PATHS].sort()
+
+function generatedRows() {
+  const rows = []
+  for (const path of corpusPaths()) {
+    for (const w of WITNESS_FORMS) {
+      rows.push({ path, id: `${path}=${witnessWord(w)}`, doc: placeWitness(path, w) })
+    }
+  }
+  return rows
+}
+
+// ---- the classifier (verification design §3.1, BINDING leg) --------------------
+//
+// The executor leg is runFlow() + mainLine() + this suite's wired mechanical effect
+// records — the one component here that already supplies a correct per-step
+// delegation outcome. A hand-rolled two-hop advance() loop withholds
+// env.delegationOutput on hop 0 and kills every pending.roles / pending.request row
+// at engine/routing.mjs:75, which would report the HARNESS as the document's
+// consequence and reverse this cycle's central finding. The
+// `classify(goodDoc()) === BENIGN` precondition below is what makes that trap a red
+// harness instead of a false product finding.
+
+// Trap C, measured at RED and not predicted by the verification design. runFlow()
+// consults its outcome oracle on the ACTIVE step id BEFORE calling advance(), and a
+// null answer means "stop here". An unresolvable id — `undefined` from `pending: {}`,
+// or `'bogus'` from `step` — is not in MAIN_LINE, so every oracle answers null and the
+// driver BREAKS WITHOUT EVER ENTERING THE EXECUTOR. Measured consequence at b6377f6:
+// the classifier reported FAULT-UNTYPED = 0 and BENIGN = 53, i.e. it certified the
+// reviewer's own witness as harmless. This is the same class as §0.2's traps A and B —
+// the harness, not the document — and it is why the precondition and this wrapper are
+// load-bearing rather than decorative. The wrapper answers a probe outcome for an id
+// the SPEC does not carry, so advance() runs and its real consequence is observed,
+// while a legitimate stop at a resolvable step (handoff → null) is untouched.
+const PROBE_OUTCOME = 'probe-unresolvable-step-id'
+const probing = (oracle) => (s, ctx) => {
+  const o = oracle(s, ctx)
+  return o == null && !mhas(spec().steps, s) ? PROBE_OUTCOME : o
+}
+
+// The engine error classes a typed fault may be an instance of. Read as a class
+// LIST, not as an oracle: the expectation ("an accepted document may only fault
+// typed") is authored. FLOW.StepResolutionError does not exist at b6377f6 and is
+// filtered out rather than crashing the filter.
+const declaredErrorClasses = () => [
+  RS.StateCorruptError, RS.StateVersionError, MECH.EffectsNotWiredError,
+  MECH.StepIncompleteError, FLOW.SlotUnsourcedError, FLOW.MissingSlotError,
+  FLOW.StepResolutionError,
+].filter((c) => typeof c === 'function')
+
+// Class and `code`, never the message. Feature design §4.4 preserves
+// `no such step: ${id}` byte-for-byte, so a message-based discriminator would
+// classify the pre-change bare Error identically and this whole case would be green
+// at b6377f6. The message's STABILITY is asserted separately, by E4.33(i).
+const isTypedEngineError = (e) => !!e
+  && typeof e.code === 'string' && e.code !== ''
+  && e.constructor !== Error
+  && declaredErrorClasses().some((C) => e instanceof C)
+
+// A spent budget that did not survive the resume. Compared against the document the
+// loader RETURNED, so the reference is the input rather than a second expectation.
+function capViolated(input, final) {
+  const before = input && input.counters
+  if (!before || typeof before !== 'object' || Array.isArray(before)) return false
+  const after = final && final.counters
+  if (!after || typeof after !== 'object') return true
+  return Object.keys(before).some((k) => !(k in after) || after[k] < before[k])
+}
+
+let _classifyDir = null
+function classify(doc, name) {
+  if (!_classifyDir) _classifyDir = tmpRoot()
+  const p = writeDoc(_classifyDir, `${String(name).replace(/[^\w=.-]/g, '_')}.json`, doc)
+  const { doc: loaded, refusal } = loadOutcome(p)
+  if (refusal) return { bucket: 'REFUSED', refusal }
+  let r = null
+  let err = null
+  try {
+    r = runFlow(spec(), { state: loaded, outcomes: probing(mainLine()), persist: () => {}, statePath: p, maxSteps: 80 })
+  } catch (e) { err = e }
+  if (err) {
+    if (err.code === 'effects-not-wired') return { bucket: 'UNREACHABLE', err }
+    return { bucket: isTypedEngineError(err) ? 'FAULT-TYPED' : 'FAULT-UNTYPED', err }
+  }
+  if (capViolated(loaded, r.state)) return { bucket: 'CAP-VIOLATION', r }
+  return { bucket: 'BENIGN', r }
+}
+
+const BUCKETS = Object.freeze(['REFUSED', 'BENIGN', 'FAULT-TYPED', 'FAULT-UNTYPED', 'CAP-VIOLATION', 'UNREACHABLE'])
+
+// One measurement, shared by E4.22 (the rule), E4.24 (the honesty of the unenforced
+// set) and E4.33(iii) — one mechanism on the test side too, and the executor runs
+// once per accepted shape rather than once per case.
+let _classified = null
+function classifiedCorpus() {
+  if (_classified) return _classified
+  _classified = generatedRows().map((row) => ({ ...row, ...classify(row.doc, row.id) }))
+  return _classified
+}
+function bucketCounts() {
+  const c = Object.fromEntries(BUCKETS.map((b) => [b, 0]))
+  for (const r of classifiedCorpus()) c[r.bucket]++
+  return c
+}
+const countLine = () => BUCKETS.map((b) => `${b}=${bucketCounts()[b]}`).join(' ')
+
+// ---- the declaration, read as INPUT only (verification design §3.4) ------------
+
+// Every path the enforced table declares: the top-level rows, plus one level of
+// `shape` rows. Path SETS are the subject of the coverage claims below; `.ok` and
+// `.expected` are never read.
+function declaredPaths() {
+  const t = RS.STATE_FIELDS || {}
+  const out = []
+  for (const k of Object.keys(t)) {
+    out.push(k)
+    const shape = t[k] && t[k].shape
+    if (shape && typeof shape === 'object') for (const sk of Object.keys(shape)) out.push(`${k}.${sk}`)
+  }
+  return out.sort()
+}
+const unenforcedRows = () => (Array.isArray(RS.STATE_UNENFORCED) ? RS.STATE_UNENFORCED : [])
+const unenforcedPaths = () => unenforcedRows().map((r) => r && r.path).filter((p) => typeof p === 'string')
+
+// The per-row honesty predicate, factored out so E4.31 can apply it to a MUTATED row
+// without touching the engine.
+function unenforcedRowFault(row) {
+  if (!row || typeof row !== 'object') return 'the row is not an object'
+  if (typeof row.path !== 'string' || row.path.trim() === '') return 'the row carries no path'
+  if (!CLAUSES.includes(row.clause)) return `clause ${JSON.stringify(row.clause)} is not one of ${CLAUSES.join('/')}`
+  if (typeof row.reason !== 'string' || row.reason.trim() === '') return 'the reason is empty — a reason a machine cannot read is a comment'
+  return null
+}
+
+// A document carrying a deliberately odd value at an unenforced path. Pattern
+// segments are resolved generically — `*` is an arbitrary (undeclared) map key,
+// `*.value` the magnitude stored under a declared one, `[]` one array element — so a
+// row the design never listed still gets a witness instead of being skipped.
+function unenforcedWitnessDoc(path, value) {
+  const doc = goodDoc()
+  const segs = path.replace(/\[\]/g, '.[]').split('.').filter(Boolean)
+  const [head, ...rest] = segs
+  const key = rest.join('.')
+  if (head === 'counters') {
+    if (key === '') return { ...doc, counters: { 'gate_plan.retry': 1 } }
+    return { ...doc, counters: key === '*' ? { 'no-such-declared-cap-key': 1 } : { 'gate_plan.retry': 0 } }
+  }
+  if (head === 'history') {
+    if (key === '') return { ...doc, history: [] }
+    return { ...doc, history: [key === '[]' ? { unread: value } : { [rest[rest.length - 1]]: value }] }
+  }
+  if (head === 'pending') {
+    return { ...doc, status: 'delegating', pending: { step: 'gate_plan', [key || 'step']: value } }
+  }
+  if (head === 'halt') {
+    return { ...doc, status: 'halted', halt: { reason: 'incomplete', step: 'validate', detail: null, [key || 'reason']: value } }
+  }
+  return { ...doc, [head]: value }
+}
+
+// ---- the totality hook's extractor (verification design §8.3) ------------------
+//
+// Pure functions of (source text, path sets), so E4.31 can apply a mutation to the
+// INPUTS and demonstrate the kill without editing engine/**.
+
+// A trailing segment produced by an intrinsic rather than by the document. The value
+// read is the Array's own, so no witness can be placed at it and no row can be
+// written for it — it normalises to its parent. Stated as a rule, so a later
+// `state.counters.length` normalises the same way without a second decision.
+const INTRINSIC_TAILS = Object.freeze(['length'])
+
+function extractStateReads(sources) {
+  const found = new Set()
+  for (const src of sources) {
+    for (const line of src.split('\n')) {
+      // Drop import lines: the specifier './run-state.mjs' otherwise yields the
+      // phantom path `mjs`, measured at b6377f6 rather than predicted.
+      if (/^\s*import\b/.test(line) || /\bfrom\s+['"]/.test(line)) continue
+      for (const m of line.matchAll(/\bstate\.[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*/g)) {
+        const segs = m[0].slice('state.'.length).split('.')
+        if (segs.length > 1 && INTRINSIC_TAILS.includes(segs[segs.length - 1])) segs.pop()
+        found.add(segs.join('.'))
+      }
+    }
+  }
+  return [...found].sort()
+}
+
+// One-way (coverage) on purpose: the converse — every declared path is read — would
+// forbid the retained pass-through rows, which exist precisely because nothing reads
+// them. The declarations supply the COVERING set and the engine source the COVERED
+// set; neither supplies the other, and no `.ok`/`.expected` is consulted.
+const uncoveredReads = (reads, declared, open) => {
+  const cover = new Set([...declared, ...open])
+  return reads.filter((p) => !cover.has(p))
+}
+
+// ---- pinned integers ----------------------------------------------------------
+//
+// [carry condition 1, GATE:PLAN cycle 3] These are RE-MEASURED under §3.1's BINDING
+// leg at RED and pinned here as literals. They are NOT verification §0.2's legs
+// (a)-(c) numbers, which were measured under three executor legs §3.1 subsequently
+// withdrew as measurably wrong; the divergence is reported in the RED report rather
+// than absorbed. The pins below are stated as the POST-change expectation, which is
+// why the pinned case is red at b6377f6.
+const CORPUS_ROWS = 98                 // 14 paths x 7 witness forms
+const REFUSED_AT_BASE = 45             // measured at b6377f6, binding leg
+const BENIGN_AT_BASE = 44              // measured at b6377f6, binding leg
+// Seven rows move from accepted to REFUSED under the `shape` row, and their
+// COMPOSITION is not the verification design's: the six NON-STRING `pending.step`
+// witnesses (null, true, 42, [], {}, absent) plus the reviewer's own `pending: {}`
+// witness, whose refusal also derives from the `pending.step` row. `pending.step: 'x'`
+// is a STRING, so no type row can refuse it — it stays ACCEPTED and must fault TYPED,
+// which is why the R3 row for `pending.step` is load-bearing rather than decorative.
+const REFUSED_MOVED = 7
+const REFUSED_EXPECTED = REFUSED_AT_BASE + REFUSED_MOVED
+const ACCEPTED_EXPECTED = CORPUS_ROWS - REFUSED_EXPECTED
+// BENIGN is INVARIANT across the change — the machine form of AC-C3 point 6, and the
+// pin this cycle is most likely to trip. The rows that move were faults, not benign
+// ones, so a BENIGN that shrinks is over-rejection.
+const BENIGN_EXPECTED = BENIGN_AT_BASE
+const FAULT_TYPED_EXPECTED = ACCEPTED_EXPECTED - BENIGN_EXPECTED
+
+await test('E4.21/AC-C3-1 (cycle 3): the DECLARATION is the contract — every refusal is attributable to a declared row, and a row exists wherever the rule requires one', () => {
+  assert.ok(RS.STATE_FIELDS && typeof RS.STATE_FIELDS === 'object', 'the enforced half must be one exported declaration')
+  assert.ok(Object.isFrozen(RS.STATE_FIELDS), 'the declaration must be frozen — a mutable contract is not a contract')
+  assert.deepEqual([...RS.STATE_KEYS].sort(), [...Object.keys(RS.STATE_FIELDS), 'version'].sort(),
+    'STATE_KEYS must stay DERIVED from the declaration, so the key set and the field set cannot drift')
+
+  const declared = new Set(declaredPaths())
+  const rows = classifiedCorpus()
+  assert.equal(rows.length, CORPUS_ROWS, 'precondition: the generated corpus must span every path x witness form')
+
+  // (a) Attribution. A refusal whose detail names a path the declaration does not
+  // carry is a check living OUTSIDE the contract — the hand-added branch AC-C3
+  // point 2 forbids. The key-set and version rejections are the two declared
+  // non-field routes and are named here rather than pattern-matched loosely.
+  const unattributed = []
+  for (const r of rows) {
+    if (r.bucket !== 'REFUSED') continue
+    if (r.refusal.code === 'state-version') continue
+    const m = /field "([^"]+)" is /.exec(r.refusal.detail || '')
+    if (!m) {
+      if (/key set/.test(r.refusal.detail || '')) continue
+      unattributed.push(`${r.id} -> ${r.refusal.detail}`)
+      continue
+    }
+    if (!declared.has(m[1])) unattributed.push(`${r.id} -> names undeclared path "${m[1]}"`)
+  }
+  assert.deepEqual(unattributed, [], `refusals that no declared row accounts for: ${unattributed.join(' | ')}`)
+
+  // (b) The other direction, which is what makes this red rather than decorative: a
+  // path at which an ACCEPTED document reaches an UNTYPED executor fault is a path
+  // the rule's R1 clause requires the contract to hold, so it must be declared.
+  const missing = [...new Set(rows.filter((r) => r.bucket === 'FAULT-UNTYPED').map((r) => r.path))]
+    .filter((p) => !declared.has(p))
+  assert.deepEqual(missing, [],
+    'the loader accepted documents that then died UNTYPED inside the executor at paths the declaration '
+    + `does not carry: ${missing.join(', ')} — declared paths are [${[...declared].join(', ')}] (${countLine()})`)
+})
+
+await test('E4.21b/AC-C3-2 (cycle 3): totality at the declared DEPTH — one inadmissible value at every declared path is refused, typed, naming that path', () => {
+  const dir = tmpRoot()
+  const paths = declaredPaths()
+  // The contract's depth is a property of the DECLARATION, not of a branch bolted on
+  // beside it (AC-C3 points 1-2). Authored expectation, not a reading of the table's
+  // correctness: if the depth lives anywhere else, a row cannot be what adds it.
+  const nested = paths.filter((p) => p.includes('.'))
+  assert.ok(nested.length > 0,
+    'the declaration expresses no depth at all — every nested constraint therefore lives in a branch, '
+    + `which is what AC-C3 point 2 forbids (declared: [${paths.join(', ')}])`)
+
+  // `true` is inadmissible under every row this contract can carry, so one generator
+  // covers the declaration exhaustively and a path added later without a working
+  // predicate fails HERE. The declaration supplies the INPUT; the expectation
+  // ("refused, typed, naming the path") is authored.
+  for (const path of paths) {
+    const { refusal } = loadOutcome(writeDoc(dir, `total-${path.replace(/\./g, '_')}.json`, placeWitness(path, true)))
+    assert.ok(refusal, `${path}: true was accepted — this declared path has no working admissibility predicate`)
+    assert.equal(refusal.code, 'state-corrupt', `${path}: the refusal must keep the code every existing caller reads`)
+    assert.match(refusal.detail, new RegExp(`field "${path.replace(/\./g, '\\.')}" is `),
+      `${path}: the refusal does not name the path that was mutated: ${refusal.detail}`)
+  }
+})
+
+await test('E4.22/AC-C3-OQ (cycle 3): the consumption classifier — an accepted document is BENIGN or faults TYPED at a recorded path, and nothing else', () => {
+  // The precondition that converts §0.2's two harness traps into a red harness rather
+  // than a false finding about the documents. Under every executor leg the
+  // verification design measured and withdrew, this line fails.
+  const reference = classify(goodDoc(), 'classifier-precondition')
+  assert.equal(reference.bucket, 'BENIGN',
+    'precondition: the unmodified reference document must classify BENIGN before any row is scored — '
+    + `it classified ${reference.bucket} (${reference.err ? `${reference.err.name}: ${reference.err.message}` : ''}${reference.refusal ? reference.refusal.detail : ''}), `
+    + 'so the classifier is measuring the harness, not the documents')
+
+  const rows = classifiedCorpus()
+  const c = bucketCounts()
+  const accepted = rows.length - c.REFUSED
+  const recorded = new Set(unenforcedPaths())
+  const declared = new Set(declaredPaths())
+
+  // The rule. accepted => (BENIGN | FAULT-TYPED), where FAULT-TYPED is admitted ONLY
+  // when the unenforced half records a row naming the faulting path — so a typed
+  // fault at an UNDECLARED path is still a failure. FAULT-UNTYPED and CAP-VIOLATION
+  // on an accepted document are unconditional failures.
+  const violations = []
+  for (const r of rows) {
+    if (r.bucket === 'REFUSED') {
+      if (!declared.has(r.path)) violations.push(`${r.id}: REFUSED at a path the declaration does not mark enforced`)
+      continue
+    }
+    if (r.bucket === 'BENIGN') continue
+    if (r.bucket === 'FAULT-TYPED') {
+      if (!recorded.has(r.path)) violations.push(`${r.id}: faults TYPED but no STATE_UNENFORCED row names "${r.path}"`)
+      continue
+    }
+    violations.push(`${r.id}: ${r.bucket} — ${r.err ? `${r.err.name}: ${r.err.message}` : 'no error'}`)
+  }
+  assert.deepEqual(violations, [], `${violations.length} row(s) break the rule (${countLine()}):\n        ${violations.join('\n        ')}`)
+
+  // Vacuity guard — the partition IDENTITY, which a classifier that stops measuring
+  // cannot satisfy because an unobserved row has no bucket, plus the pinned literals.
+  assert.equal(c.BENIGN + c['FAULT-TYPED'] + c['FAULT-UNTYPED'] + c['CAP-VIOLATION'], accepted,
+    `the partition is not total over the accepted shapes — some row has no observed consequence (${countLine()})`)
+  assert.equal(c.UNREACHABLE, 0, `the executor leg is mis-wired: ${countLine()}`)
+  assert.equal(c.REFUSED, REFUSED_EXPECTED, `REFUSED moved off its pin (${countLine()})`)
+  assert.equal(accepted, ACCEPTED_EXPECTED, `accepted moved off its pin (${countLine()})`)
+  assert.equal(c.BENIGN, BENIGN_EXPECTED, `BENIGN is not invariant across the change — the contract over-rejects (${countLine()})`)
+  assert.equal(c['FAULT-TYPED'], FAULT_TYPED_EXPECTED, `the observed-and-typed floor moved (${countLine()})`)
+})
+
+await test('E4.23/AC-C3-5 (cycle 3): no loader-accepted TYPE fault can restart a spent budget', () => {
+  const sp = spec()
+  const dir = tmpRoot()
+  const capKey = 'gate_plan.retry'
+  const cap = RT.capValue(sp, capKey)
+  const spentBase = () => ({ ...goodDoc(), step: 'gate_plan', counters: { [capKey]: cap } })
+  const resume = (state, tag) => runFlow(sp, {
+    state, maxSteps: 12, statePath: join(dir, `${tag}.json`), persist: () => {}, outcomes: probing(oneShot('gate_plan', 'fail')),
+  })
+
+  // The reference is MEASURED, not authored: with the budget intact on disk the
+  // resume refuses the retry and routes to the declared exhaustion target.
+  const ref = resume(JSON.parse(JSON.stringify(spentBase())), 'reference')
+  const refLast = ref.trace[ref.trace.length - 1]
+  assert.ok(refLast && refLast.exhausted, 'precondition: a resume carrying the spent budget must refuse the retry')
+
+  // Scope, narrowed by the design (verification §2 / feature §1.3 `counters.*.value`):
+  // the generator perturbs counters BY TYPE TAG only. `counters: {}` and
+  // `counters: {'gate_plan.retry': 0}` are well-typed TAMPERING, declared out of the
+  // threat model, so `counters` rows are excluded here by declaration rather than
+  // discovered as a red row.
+  const rows = generatedRows().filter((r) => r.path !== 'counters')
+  assert.ok(rows.length > CORPUS_ROWS - 10, 'precondition: only the counters rows are out of scope')
+
+  const escaped = []
+  let drivenAccepted = 0
+  for (const row of rows) {
+    const doc = { ...row.doc, ...spentBase(), ...(row.path.startsWith('counters') ? {} : {}) }
+    // Re-place the witness on the spent-budget base so the mutation, not the base,
+    // is what varies.
+    const seg = row.path.split('.')
+    if (seg.length === 1) {
+      if (!(seg[0] in row.doc)) delete doc[seg[0]]
+      else doc[seg[0]] = row.doc[seg[0]]
+    } else {
+      doc[seg[0]] = row.doc[seg[0]]
+    }
+    doc.counters = { [capKey]: cap }
+    const p = writeDoc(dir, `spent-${row.id.replace(/[^\w=.-]/g, '_')}.json`, doc)
+    const { doc: loaded, refusal } = loadOutcome(p)
+    if (refusal) continue
+    drivenAccepted++
+    let r = null
+    let err = null
+    try { r = resume(loaded, `run-${drivenAccepted}`) } catch (e) { err = e }
+    if (err) {
+      if (!isTypedEngineError(err)) escaped.push(`${row.id}: stopped UNTYPED — ${err.name}: ${err.message}`)
+      continue
+    }
+    const spent = r.state.counters && r.state.counters[capKey]
+    if (!(typeof spent === 'number' && spent >= cap)) {
+      escaped.push(`${row.id}: the resume finished with ${capKey} = ${JSON.stringify(spent)}, below the ${cap} already spent`)
+      continue
+    }
+    const granted = r.trace.find((e) => e.capKey === capKey && !e.exhausted)
+    if (granted) escaped.push(`${row.id}: the resume was granted a fresh retry on an exhausted budget`)
+  }
+  assert.ok(drivenAccepted > 10, `precondition: the corpus must exercise many accepted resumes, drove ${drivenAccepted}`)
+  assert.deepEqual(escaped, [], `documents that escaped the cap invariant:\n        ${escaped.join('\n        ')}`)
+})
+
+await test('E4.24/AC-C3-3 (cycle 3): the UNENFORCED half is declared, honest, and honest BY MEASUREMENT', () => {
+  const rows = unenforcedRows()
+  assert.ok(Array.isArray(RS.STATE_UNENFORCED),
+    'engine/run-state.mjs exports no STATE_UNENFORCED — the boundary is stated in one direction only, so '
+    + '"you did not validate X" has nothing to point at and the next cycle re-opens the depth question')
+  assert.ok(rows.length > 0, 'the unenforced half is empty — every path the rule leaves open is then an omission, not a decision')
+  assert.ok(Object.isFrozen(RS.STATE_UNENFORCED), 'the unenforced half must be frozen data, not a mutable note')
+
+  const declared = new Set(declaredPaths())
+
+  // The partition is asserted FIRST (feature §3.2's stated invariant), so a future row
+  // that is neither form fails here rather than silently skipping clause (ii).
+  const illFormed = rows.filter((r) => {
+    if (!r || typeof r.path !== 'string') return true
+    return declared.has(r.path) && r.clause !== 'R3'
+  })
+  assert.deepEqual(illFormed.map((r) => (r && r.path) || String(r)), [],
+    'a row whose path IS type-enforced must record clause R3 (the value DOMAIN is open while the type is not); '
+    + 'anything else makes the two tables contradict each other')
+
+  // (i) the reason is machine-readable DATA on the row, with a clause from the rule.
+  const faults = rows.map((r) => [r && r.path, unenforcedRowFault(r)]).filter(([, f]) => f !== null)
+  assert.deepEqual(faults, [], `unenforced rows that do not carry a usable decision: ${faults.map(([p, f]) => `${p}: ${f}`).join(' | ')}`)
+
+  // (ii) THE OVER-REJECTION GUARD, and the half that makes this a contract: for every
+  // row with no type row of its own, a witness placed at that path must LOAD. If a
+  // deliberately-open path silently became enforced, this reds. Scoped to undeclared
+  // paths — a witness of 42 at a type-enforced path is correctly refused, so applying
+  // (ii) there would go red on exactly the rows it exists to bless.
+  const dir = tmpRoot()
+  const overRejected = []
+  let openRows = 0
+  for (const r of rows) {
+    if (declared.has(r.path)) continue
+    openRows++
+    const doc = unenforcedWitnessDoc(r.path, 42)
+    assert.notDeepEqual(doc, goodDoc(), `${r.path}: the witness builder produced an unmodified document — clause (ii) would be vacuous`)
+    const { refusal } = loadOutcome(writeDoc(dir, `open-${r.path.replace(/[^\w]/g, '_')}.json`, doc))
+    if (refusal) overRejected.push(`${r.path}: declared UNENFORCED but refused — ${refusal.detail}`)
+  }
+  assert.ok(openRows > 0, 'precondition: the unenforced half must carry at least one genuinely open path')
+  assert.deepEqual(overRejected, [], `rows the declaration calls open that the loader in fact refuses:\n        ${overRejected.join('\n        ')}`)
+
+  // (iii) the stated reason is TRUE, not asserted: the measured executor consequence
+  // of a witness at each unenforced path is benign or typed. For the R3 rows whose
+  // TYPE is enforced this is the substantive half — it is what proves the fault is
+  // FAULT-TYPED rather than the untyped crash the reviewer reported.
+  const dishonest = []
+  for (const r of rows) {
+    const value = declared.has(r.path) ? 'no-such-value-in-any-domain' : 42
+    const v = classify(unenforcedWitnessDoc(r.path, value), `unenforced-${r.path.replace(/[^\w]/g, '_')}`)
+    if (v.bucket === 'REFUSED') continue
+    if (v.bucket === 'BENIGN' || v.bucket === 'FAULT-TYPED') continue
+    dishonest.push(`${r.path}: recorded ${r.clause} "${r.reason}" but a witness there classifies ${v.bucket}`
+      + `${v.err ? ` — ${v.err.name}: ${v.err.message}` : ''}`)
+  }
+  assert.deepEqual(dishonest, [], `unenforced rows whose stated reason is contradicted by measurement:\n        ${dishonest.join('\n        ')}`)
+})
+
+await test('E4.25/AC-C3 (cycle 3): the reviewer\'s witness — pending: {} — is refused as a CONSEQUENCE of a row, naming the declared path', () => {
+  const dir = tmpRoot()
+  const rows = [
+    ['pending: {} — the reported witness', { ...goodDoc(), pending: {} }, 'pending.step'],
+    ['pending: { step: 42 } — the same row, one level of type', { ...goodDoc(), pending: { step: 42 } }, 'pending.step'],
+    ['pending: [] — an array is not a nullable object', { ...goodDoc(), pending: [] }, 'pending'],
+  ]
+  for (const [why, doc, path] of rows) {
+    const { doc: got, refusal } = loadOutcome(writeDoc(dir, `witness-${path}-${why.length}.json`, doc))
+    assert.ok(refusal, `${why}: ACCEPTED (pending = ${JSON.stringify(got && got.pending)}) — the document reaches the executor, `
+      + 'which dereferences state.pending.step at engine/flow.mjs:288 and throws a raw, unnamed Error one layer below the boundary that must refuse it')
+    assert.equal(refusal.code, 'state-corrupt', `${why}: the refusal must keep the code every existing caller reads`)
+    assert.ok(refusal instanceof RS.StateCorruptError, `${why}: the refusal must be the typed load-boundary error`)
+    assert.match(refusal.detail, new RegExp(`field "${path.replace('.', '\\.')}" is `),
+      `${why}: the refusal must name the declared path it derives from, not the witness shape: ${refusal.detail}`)
+  }
+  // No branch may mention the witness. A special case for `{}` satisfies the three
+  // rows above and still leaves the class open, which is the whole of AC-C3 point 2.
+  const src = engineSrc('run-state.mjs')
+  assert.ok(!/pending\s*[=!]==?\s*\{\s*\}|Object\.keys\(\s*\w*pending/.test(src),
+    'the refusal is implemented as a hand-written branch about `pending`, not as a row of the declaration')
+})
+
+await test('E4.26/AC-C3-5 (cycle 3): a resume that cannot proceed stops TYPED — the failure CLASS, not only the witness', () => {
+  const sp = spec()
+  const rows = [
+    ['pending: { step: "nope" } — well-typed, right shape, unresolvable', { ...goodDoc(), step: 'gate_plan', status: 'delegating', pending: { step: 'nope', roles: [], request: {} } }],
+    ['step: "bogus" — a field cycle 2 already type-checks, pending not involved at all', { ...goodDoc(), step: 'bogus' }],
+  ]
+  for (const [why, doc] of rows) {
+    let err = null
+    try {
+      runFlow(sp, { state: doc, outcomes: probing(mainLine()), persist: () => {}, statePath: SCRATCH_STATE, maxSteps: 4 })
+    } catch (e) { err = e }
+    assert.ok(err, `${why}: the resume did not stop at all`)
+    // Class and code only. The message string is asserted in E4.33(i) as a
+    // PRESERVATION property and deliberately never here: a message assertion is green
+    // at b6377f6 and would let the "revert to a bare Error, keep the text" mutant live.
+    assert.ok(typeof FLOW.StepResolutionError === 'function',
+      `${why}: engine/flow.mjs exports no typed error for an unresolvable step id, so the resume escapes as ${err.name}: ${err.message}`)
+    assert.ok(err instanceof FLOW.StepResolutionError, `${why}: the stop is ${err.name}, not the typed StepResolutionError`)
+    assert.equal(err.code, 'no-such-step', `${why}: the typed stop must carry a stable machine-readable code`)
+    assert.notEqual(err.constructor, Error, `${why}: a bare Error carries no identity a caller can branch on`)
+  }
+})
+
+await test('E4.27/AC-C3-6 (cycle 3): no over-rejection — every document a real run persists still loads, and the cycle-3 boundary forms with it', () => {
+  const dir = tmpRoot()
+  const docs = acceptanceCorpus()
+  assert.ok(docs.length > 3, 'precondition: the corpus must span several persisted hops')
+  docs.forEach((s, i) => {
+    const { refusal } = loadOutcome(writeDoc(dir, `c3-corpus-${i}.json`, s))
+    assert.ok(!refusal, `a document a real run persisted was refused by the deeper contract: ${refusal && refusal.detail}`)
+  })
+  // The boundary forms this cycle measured. Each is a shape the rule deliberately
+  // admits, so a broader check must be a decision rather than a drift.
+  const g = goodDoc()
+  const rows = [
+    ['a delegating document with NO roles and NO request resumes correctly (M4)', { ...g, step: 'gate_plan', status: 'delegating', pending: { step: 'gate_plan' } }],
+    ['pending carries junk beside step — nested key sets stay OPEN', { ...g, status: 'delegating', pending: { step: 'gate_plan', junk: 1 } }],
+    ['halt: {} on a halted document is pass-through only (M6)', { ...g, status: 'halted', halt: {} }],
+    ['halt internals are unenforced', { ...g, status: 'halted', halt: { reason: 42, step: [], detail: {} } }],
+    ['a status outside {running,delegating,halted} is a value DOMAIN, not a type (M5)', { ...g, status: 'bogus' }],
+    ['a step id the spec does not carry is the document\'s agreement with a spec, not a document property', { ...g, step: 'bogus' }],
+    ['history elements are still not element-checked', { ...g, history: [{}, { anything: 1 }] }],
+    ['counter KEY names are still not validated', { ...g, counters: { 'not-a-declared-cap-key': 1 } }],
+  ]
+  rows.forEach(([why, doc], i) => {
+    const { refusal } = loadOutcome(writeDoc(dir, `c3-boundary-${i}.json`, doc))
+    assert.ok(!refusal, `over-rejection — ${why}: ${refusal && refusal.detail}`)
+  })
+})
+
+await test('E4.28/AC-C3-4 (cycle 3): the contract is reachable from the PR — it is stated in a git-tracked file on the diff surface, not in a gitignored artifact', () => {
+  const file = 'engine/run-state.mjs'
+  assert.ok(!file.startsWith('.autoflow/'), 'a contract stated only in a gitignored artifact is invisible to a reviewer by construction')
+  let tracked = true
+  try { execFileSync('git', ['ls-files', '--error-unmatch', file], { cwd: root, stdio: 'ignore' }) } catch { tracked = false }
+  assert.ok(tracked, `${file} is not git-tracked, so the contract never appears on a reviewed diff`)
+
+  const src = engineSrc('run-state.mjs')
+  assert.ok(/STATE_UNENFORCED/.test(src), `${file} does not state the unenforced half, so the boundary is stated in one direction only`)
+  // Every clause a row cites must be resolvable by a reviewer reading THIS file: the
+  // row says "R2" and the file must say what R2 is. A clause id with no statement
+  // beside it is the prose-versus-data split the declaration exists to end.
+  const cited = [...new Set(unenforcedRows().map((r) => r && r.clause).filter(Boolean))].sort()
+  assert.ok(cited.length > 0, 'no clause is cited by any row — the rows record no rule at all')
+  for (const clause of cited) {
+    assert.match(src, new RegExp(`^\\s*//.*\\b${clause}\\b`, 'm'),
+      `${file} cites clause ${clause} on a row but never states what ${clause} is`)
+  }
+})
+
+await test('E4.29/AC-C3-2 (cycle 3): the write side inherits the new depth through the SAME pass — nothing can be written that cannot be read back', () => {
+  const dir = tmpRoot()
+  const path = join(dir, 'run-4.json')
+  const bad = { ...goodDoc(), pending: {} }
+  let write = null
+  assert.throws(() => RS.saveState(path, bad), (e) => { write = e; return true },
+    'saveState persisted a document its own loader refuses — the deeper contract landed at the read boundary only')
+  const read = loadOutcome(writeDoc(dir, 'r.json', bad))
+  assert.ok(read.refusal, 'precondition: the reader must refuse the witness')
+  assert.equal(write.code, read.refusal.code, 'the two directions must agree on the CODE (not on the detail — verification §3.2)')
+  // Ordering, exactly as E4.15 pins it one level up: a check placed one line late
+  // leaves run-4.json.tmp behind and regresses the atomicity property.
+  assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith('.tmp')), [], 'the refused save left a temp file in the state root')
+
+  // The write side must not over-reject either: every path the declaration calls open
+  // must still SAVE, or a real run stops being able to persist its own output.
+  const refusedOpen = []
+  for (const r of unenforcedRows()) {
+    if (declaredPaths().includes(r.path)) continue
+    try { RS.saveState(join(dir, `open-${r.path.replace(/[^\w]/g, '_')}.json`), unenforcedWitnessDoc(r.path, 42)) } catch (e) { refusedOpen.push(`${r.path}: ${e.detail || e.message}`) }
+  }
+  assert.deepEqual(refusedOpen, [], `the write side refuses paths the declaration calls open:\n        ${refusedOpen.join('\n        ')}`)
+})
+
+await test('E4.30/AC-C3-1 (cycle 3): the nested refusal reports the DOTTED path and the expected type — the message format extends, it does not change', () => {
+  const dir = tmpRoot()
+  // PROSE_SOURCED, transcribed from .autoflow/issue-4-feature-design.md §4.3.
+  // Deliberately NOT read off RS.STATE_FIELDS.pending.shape.step.expected: their
+  // AGREEMENT is the assertion, not its premise (verification §3.4, applied at depth).
+  const NESTED_PHRASE = 'field "pending.step" is undefined — expected a string'
+  const { refusal } = loadOutcome(writeDoc(dir, 'nested-message.json', { ...goodDoc(), pending: {} }))
+  assert.ok(refusal, 'pending: {} was accepted, so no message exists to check')
+  assert.ok(refusal.detail.includes(NESTED_PHRASE),
+    `the nested refusal does not use the design's sentence at depth: ${refusal.detail}`)
+  assert.match(refusal.message, /run state is corrupt — /, 'the outer message envelope must be unchanged')
+  // The E4.20 property must hold at depth too: a type is named, the untrusted value
+  // never is.
+  const marker = 'UNTRUSTED-7b2e40-VALUE'
+  const echo = loadOutcome(writeDoc(dir, 'nested-echo.json', { ...goodDoc(), pending: { step: { [marker]: marker } } }))
+  assert.ok(echo.refusal, 'a wrong-typed nested value was accepted')
+  assert.ok(!echo.refusal.message.includes(marker), `the nested refusal echoes the untrusted value: ${echo.refusal.detail}`)
+})
+
+await test('E4.31/AC-C3-2 (cycle 3): the declaration-level mutation battery — each mutant is killed by a live assertion, demonstrated by applying it to the INPUTS', () => {
+  assert.ok(Array.isArray(RS.STATE_UNENFORCED) && RS.STATE_UNENFORCED.length > 0,
+    'precondition: the battery needs the unenforced half to exist before a mutation of it can be shown to kill')
+  const reads = extractStateReads([engineSrc('flow.mjs'), engineSrc('escalate.mjs')])
+  const declared = declaredPaths()
+  const open = unenforcedPaths()
+  assert.deepEqual(uncoveredReads(reads, declared, open), [],
+    'precondition: the unmutated declaration must cover the engine\'s directly-dereferenced read set')
+
+  const kills = [
+    ['emptying STATE_UNENFORCED', () => uncoveredReads(reads, declared, [])],
+    ['dropping every nested `shape` row', () => uncoveredReads(reads, declared.filter((p) => !p.includes('.')), open)],
+    ['an engine edit that starts dereferencing a NEW nested path',
+      () => uncoveredReads(extractStateReads([`${engineSrc('flow.mjs')}\nconst probe = state.pending.newlyRead\n`, engineSrc('escalate.mjs')]), declared, open)],
+  ]
+  for (const [mutant, run] of kills) {
+    const uncovered = run()
+    assert.ok(uncovered.length > 0, `mutant survives — ${mutant} left the coverage assertion green`)
+  }
+  // The row-honesty predicate kills its own mutant.
+  const emptyReason = { ...RS.STATE_UNENFORCED[0], reason: '   ' }
+  assert.ok(unenforcedRowFault(emptyReason) !== null, 'mutant survives — an unenforced row with an empty reason is accepted as a decision')
+  const badClause = { ...RS.STATE_UNENFORCED[0], clause: 'R9' }
+  assert.ok(unenforcedRowFault(badClause) !== null, 'mutant survives — a row citing a clause the rule does not define is accepted')
+
+  // Stated limit, not overclaimed: mutants INSIDE the loader (dropping the `shape`
+  // recursion, recursing when value === null, dropping the nested .sort(),
+  // substituting describeType at depth, reverting StepResolutionError to a bare
+  // Error) cannot be applied here without editing engine/**, which is outside this
+  // file's scope. They are killed by the polarity of E4.25 / E4.27 / E4.11 / E4.30 /
+  // E4.26 respectively, each of which fails against exactly one of them.
+})
+
+await test('E4.32/AC-C3-3 (cycle 3): the declaration is TOTAL over the engine\'s directly-dereferenced read set', () => {
+  const reads = extractStateReads([engineSrc('flow.mjs'), engineSrc('escalate.mjs')])
+  assert.ok(reads.length > 8, `precondition: the extractor must find the engine's read set, found [${reads.join(', ')}]`)
+  assert.ok(!reads.includes('mjs'), 'the extractor matched the ./run-state.mjs import specifier — import lines must be excluded')
+  assert.ok(reads.includes('pending.step'), 'precondition: the extractor must see the depth-2 read this cycle is about')
+  assert.ok(!reads.includes('history.length'), 'an Array intrinsic must normalise to its parent — no witness can be placed at it')
+
+  const uncovered = uncoveredReads(reads, declaredPaths(), unenforcedPaths())
+  assert.deepEqual(uncovered, [],
+    `the engine reads paths the contract records no decision about: ${uncovered.join(', ')} — `
+    + 'each is either enforced by a row or recorded as deliberately open, and this case is what re-asks '
+    + 'the depth question automatically whenever the engine\'s read set moves')
+
+  // The guarantee, stated exactly. An ALIASED read escapes any state.* extractor —
+  // engine/escalate.mjs binds `const last = state.history[...]` and then reads
+  // `last.capKey`. That row is carried by hand in STATE_UNENFORCED, and this case
+  // cannot derive it. A hook claiming the stronger property would be the unfalsifiable
+  // prose the exported declaration exists to replace.
+  assert.ok(unenforcedPaths().some((p) => p.startsWith('history')),
+    'the aliased history[] read that no extractor can see must be recorded by hand')
+})
+
+await test('E4.33(i)/AC-C3-5 (cycle 3): the typed lookup PRESERVES the message text — asserted here, never in E4.26', () => {
+  const sp = spec()
+  // Quarantined on purpose. E4.26 asserts class + code and would let the mutant
+  // "revert to a bare Error, keep the text" live if it also asserted the string;
+  // this case asserts the string and would let the mutant live if it were merged
+  // into E4.26. The pair kills it; either alone does not.
+  for (const [stepId, doc] of [
+    ['nope', { ...goodDoc(), step: 'gate_plan', status: 'delegating', pending: { step: 'nope' } }],
+    ['bogus', { ...goodDoc(), step: 'bogus' }],
+  ]) {
+    let err = null
+    try { runFlow(sp, { state: doc, outcomes: probing(mainLine()), persist: () => {}, statePath: SCRATCH_STATE, maxSteps: 4 }) } catch (e) { err = e }
+    assert.ok(err, `${stepId}: the resume did not stop`)
+    assert.ok(typeof FLOW.StepResolutionError === 'function' && err instanceof FLOW.StepResolutionError,
+      `${stepId}: the stop is not the typed error, so there is no preservation property to check (${err.name})`)
+    assert.equal(err.message, `no such step: ${stepId}`, `${stepId}: the operator-facing text changed with the class`)
+  }
+})
+
+// The pre-change behaviour of every accepted run, CAPTURED at b6377f6 and authored
+// into the RED commit. [MUST] It is never re-derived by running the post-change code:
+// a self-comparison is green under any behaviour change, which would make E4.33(ii)
+// decorative and leave the executor change with no non-regression evidence at all.
+// Pinned as a digest of the full trace rather than as the trace itself: the corpus is
+// every hop a real run persists, so the literal would be tens of kilobytes of data in
+// a file whose other fixtures are all a handful of lines. The readable pins beside it
+// carry the diagnosis when the digest moves.
+const PRE_CHANGE_TRACE_SHA256 = '12002f694dfa8650e68513e431be67ed712fe9a75080d405609714d2db326cfa'
+const PRE_CHANGE_TRACE_DOCS = 59
+const PRE_CHANGE_TRACE_ENDS = ['escalate/halted/escalate', 'handoff/running/null', 'validate/halted/null']
+
+function corpusTrace() {
+  const sp = spec()
+  return acceptanceCorpus().map((doc) => {
+    let r = null
+    let err = null
+    try { r = runFlow(sp, { state: JSON.parse(JSON.stringify(doc)), outcomes: mainLine(), persist: () => {}, statePath: SCRATCH_STATE, maxSteps: 80 }) } catch (e) { err = e }
+    if (err) return { error: `${err.name}: ${err.message}` }
+    return {
+      events: r.events.map((e) => e.kind).join(','),
+      transitions: r.trace.map((t) => `${t.from}:${t.resolvedOutcome || t.outcome}->${t.to}`).join(','),
+      step: r.state.step, status: r.state.status, terminal: r.state.terminal,
+      counters: r.state.counters,
+    }
+  })
+}
+
+await test('E4.33(ii)/AC-C3-5 (cycle 3): the typed lookup is behaviour-NEUTRAL on every accepted run, against a baseline captured before the change', () => {
+  const trace = corpusTrace()
+  assert.equal(trace.length, PRE_CHANGE_TRACE_DOCS, 'the acceptance corpus itself moved, so the baseline no longer describes it')
+  assert.deepEqual([...new Set(trace.map((t) => `${t.step}/${t.status}/${t.terminal}`))].sort(), PRE_CHANGE_TRACE_ENDS,
+    'an accepted run ends somewhere the pre-change tree never ended')
+  assert.deepEqual(trace.filter((t) => t.error), [], `an accepted run now throws: ${JSON.stringify(trace.filter((t) => t.error))}`)
+  assert.equal(createHash('sha256').update(JSON.stringify(trace)).digest('hex'), PRE_CHANGE_TRACE_SHA256,
+    'an accepted run changed behaviour — the executor edit was supposed to change only the CLASS of a failure, '
+    + 'and the event sequence, transition list, final state and counters of every corpus resume were captured at b6377f6 to prove it')
+})
+
+await test('E4.33(iii)/AC-C3-6 (cycle 3): the added rejection surface is ENUMERATED, not merely bounded', () => {
+  const refused = classifiedCorpus().filter((r) => r.bucket === 'REFUSED')
+  assert.equal(refused.length, REFUSED_EXPECTED, `the rejection surface moved off its pin (${countLine()})`)
+  // Every refusal that names a NESTED path must derive from the ONE row the change
+  // adds. Measured composition of the seven: the six non-string `pending.step`
+  // witnesses, plus `pending: {}` itself, whose refusal is attributed to `pending.step`
+  // because that is the row it violates. `pending.step: 'x'` is a string and is
+  // deliberately NOT among them — it stays accepted and is answered at the point of use.
+  const nested = refused
+    .map((r) => [r.id, /field "([^"]+)" is /.exec(r.refusal.detail || '')])
+    .filter(([, m]) => m && m[1].includes('.'))
+  assert.deepEqual([...new Set(nested.map(([, m]) => m[1]))].filter((p) => p !== 'pending.step'), [],
+    'the change refuses at a nested path other than the one row it adds')
+  assert.equal(nested.length, REFUSED_MOVED,
+    `exactly ${REFUSED_MOVED} generated rows may newly be refused, and every one must derive from the pending.step row — got `
+    + `${nested.length}: ${nested.map(([id]) => id).join(', ')}`)
+})
+
+await test('E4.34/AC-C3-1 (cycle 3): the write side mirrors the VERSION check too — the round-trip property holds over the whole document, not over eight of its nine keys', () => {
+  const dir = tmpRoot()
+  const path = join(dir, 'version.json')
+  // Measured on a clean tree at b6377f6, and the reason this case exists: saveState
+  // ACCEPTS and writes { ...good, version: 2 }, while loadState on the very same file
+  // throws StateVersionError. So engine/run-state.mjs:74-76's "nothing can be written
+  // that cannot be read back" is false as shipped — `version` is admitted by a branch
+  // at :118 that sits OUTSIDE the declaration schemaFault() walks, and the write side
+  // has no mirror of it. This case pins the resolution: the write side refuses it.
+  // The alternative resolution — merely RECORDING the asymmetry in the declaration —
+  // is rejected here on purpose: it documents the hole rather than closing it, and
+  // AC-C3 point 5's invariant is discharged by what the boundary refuses, not by what
+  // it describes.
+  let write = null
+  assert.throws(() => RS.saveState(path, { ...goodDoc(), version: RS.STATE_VERSION + 1 }),
+    (e) => { write = e; return true },
+    'saveState persisted a document that its own loadState refuses with StateVersionError — '
+    + 'the "nothing can be written that cannot be read back" property does not hold over `version`')
+  assert.equal(write.code, 'state-version', 'the two directions must report the same code for the same defect')
+  assert.deepEqual(readdirSync(dir), [], 'the refused save must run before the temp write, exactly as the field pass does')
+
+  // and it must not over-reject: the current version still writes and still reads back.
+  RS.saveState(path, goodDoc())
+  assert.deepEqual(RS.loadState(path), goodDoc())
+})
+
+
+// ================================================================================
 // GROUP 5 — the non-interactive escalate protocol (AC5)
 // ================================================================================
 
@@ -2179,6 +3015,28 @@ await test('E5.3(f)/AC4 (cycle 2): a CLI resume from a wrong-typed document fail
   // escalate() (exit 2) fails loudly; it has no discriminating power by construction,
   // since both the corrupt-state child and the effects-not-wired child exit 1.
   assert.equal(res.status, 1)
+})
+
+await test('E5.3(g)/AC-C3-5 (cycle 3): a CLI resume that cannot resolve its step stops TYPED, and the reviewer\'s witness stops at the LOAD boundary', () => {
+  const dir = tmpRoot()
+  // Constraints, measured rather than assumed (engine/cli.mjs:20-38 has no try/catch):
+  // (i) exit != 0 is asserted, never a DISTINCT exit code — both the corrupt-state
+  // child and the effects-not-wired child exit 1, which is why E5.3(f) already
+  // discriminates on stderr; (ii) no catch may be added to cli.mjs to make this case
+  // easier, since that would move the exit-code surface E5.3(f) pins.
+  const rows = [
+    ['M1 pending: {} — post-change this never reaches the executor at all', { ...goodDoc(), pending: {} }, /state-corrupt|StateCorruptError/],
+    ['M2 pending: { step: "nope" } — well-typed, unresolvable', { ...goodDoc(), step: 'gate_plan', status: 'delegating', pending: { step: 'nope' } }, /StepResolutionError|no-such-step/],
+    ['M3 step: "bogus" — pending not involved at all', { ...goodDoc(), step: 'bogus' }, /StepResolutionError|no-such-step/],
+  ]
+  rows.forEach(([why, doc, wanted], i) => {
+    const path = join(dir, `cli-c3-${i}.json`)
+    writeFileSync(path, JSON.stringify(doc))
+    const res = runCli(path)
+    assert.notEqual(res.status, 0, `${why}: the child exited 0 — the run was allowed to proceed`)
+    assert.match(res.stderr, wanted, `${why}: the child reported neither the typed stop nor the refusal that caused it`)
+    assert.ok(!/effects-not-wired/.test(res.stderr), `${why}: the child died at a wiring error, so it had already been let past the failure under test`)
+  })
 })
 
 await test('E5.4/AC5: notify receives a JSON-serializable RECORD, not a formatted string', () => {
