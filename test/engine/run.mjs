@@ -571,6 +571,98 @@ await test('E6.6/AC6: docs/maintained-docs.md registers the new suite and no lon
   }
 })
 
+// ---- reference integrity of this suite's own engine citations (AC6) -------------
+//
+// Three times in one cycle a line shift inside engine/** silently invalidated the
+// `<module>.mjs:<line>` anchors written in the comments here, and twice the shift was
+// caused by this cycle's own commits. A broken anchor is worse than no anchor: it
+// still reads as evidence, and the reader who follows it lands on an unrelated line
+// and takes it for the claim.
+//
+// Preference order, and it is not cosmetic: a citation that names a SYMBOL cannot go
+// stale, so it beats a line citation that has to be checked. Every citation into
+// engine/run-state.mjs was rewritten to symbol form for exactly that reason — its
+// numbering moved twice in this cycle alone. What is left below is the residue where
+// the claim is about a specific EXPRESSION that no symbol name locates, and each of
+// those carries the token the citing comment says is there.
+const CITED_SOURCES = Object.freeze(['test/engine/run.mjs', 'test/spec/run.mjs'])
+
+// AUTHORED, in the PROSE_SOURCED shape: the token is what the citing comment CLAIMS is
+// at that line. It is never read back out of the engine to build the expectation —
+// that would make the case agree with whatever the line happens to say.
+const LINE_ANCHOR_TOKENS = Object.freeze({
+  'flow.mjs:237': 'const halt = { reason:',
+  'flow.mjs:247': 'pending: { step: stepId',
+  'flow.mjs:254': '{ ...state.counters }',
+  'flow.mjs:257': 'spent >= capValue(',
+  'flow.mjs:279': '[...state.history, entry]',
+  'flow.mjs:303': 'state.pending ? state.pending.step : state.step',
+  'routing.mjs:75': 'declares no outcome',
+  'cli.mjs:29': 'NO_EFFECTS',
+  'lint.mjs:6': 'Findings are reported, never',
+})
+
+// The symbols this suite cites BY NAME rather than by line. Each must still be defined
+// in the module named — which is the whole point: no line shift can break it.
+const SYMBOL_ANCHORS = Object.freeze({
+  'run-state.mjs': ['loadState', 'saveState', 'schemaFault', 'StateVersionError', 'STATE_UNENFORCED'],
+  'flow.mjs': ['StepResolutionError', 'delegateOn'],
+})
+
+const CITATION_RE = () => /\bengine\/([a-z-]+\.mjs):(\d+)/g
+
+await test('E6.7/AC6: every engine citation this suite makes still resolves to what it claims', () => {
+  const cited = new Map()
+  for (const rel of CITED_SOURCES) {
+    const src = readRepo(rel)
+    for (const m of src.matchAll(CITATION_RE())) {
+      const key = `${m[1]}:${m[2]}`
+      if (!cited.has(key)) cited.set(key, [])
+      cited.get(key).push(rel)
+    }
+  }
+  assert.ok(cited.size > 5, `precondition: the scan must find this suite's citations, found ${cited.size}`)
+
+  // A citation with no token cannot be checked. Adding one is the cost of writing a
+  // line number down; the alternative the comment header states is to cite a symbol.
+  const unregistered = [...cited.keys()].filter((k) => !(k in LINE_ANCHOR_TOKENS)).sort()
+  assert.deepEqual(unregistered, [],
+    `line citations with no token to check them against: ${unregistered.join(', ')} — `
+    + 'either register the token this citation claims is there, or rewrite it to cite a symbol')
+
+  // and the table may not rot in the other direction either.
+  const dead = Object.keys(LINE_ANCHOR_TOKENS).filter((k) => !cited.has(k)).sort()
+  assert.deepEqual(dead, [], `registered anchors nothing cites any more: ${dead.join(', ')}`)
+
+  const broken = []
+  for (const [key, token] of Object.entries(LINE_ANCHOR_TOKENS)) {
+    const [file, n] = key.split(':')
+    const lines = engineSrc(file).split('\n')
+    const line = lines[Number(n) - 1]
+    if (line === undefined) { broken.push(`${key}: past the end of the file (${lines.length} lines)`); continue }
+    if (!line.includes(token)) broken.push(`${key}: cited for ${JSON.stringify(token)}, actually ${JSON.stringify(line.trim().slice(0, 60))} [cited in ${cited.get(key).join(', ')}]`)
+  }
+  assert.deepEqual(broken, [],
+    `citations that no longer resolve to what they claim:\n        ${broken.join('\n        ')}`)
+
+  // The symbol-anchored half. These are the citations that CANNOT go stale, and the
+  // check is that the name they use is still the name the module defines.
+  const missing = []
+  for (const [file, symbols] of Object.entries(SYMBOL_ANCHORS)) {
+    const src = engineSrc(file)
+    for (const sym of symbols) {
+      if (!new RegExp(`\\b(?:function|class|const|let)\\s+${sym}\\b`).test(src)) missing.push(`${file} > ${sym}`)
+    }
+  }
+  assert.deepEqual(missing, [], `symbols this suite cites by name that the module no longer defines: ${missing.join(', ')}`)
+
+  // Backs the claim E5.3(g) makes in prose rather than leaving it as a comment: the
+  // CLI has no try/catch, which is why a throw from either boundary surfaces as node's
+  // uncaught-exception stack and why that case may not assert a distinct exit code.
+  assert.ok(!/\b(?:try\s*\{|catch\s*\()/.test(engineSrc('cli.mjs')),
+    'engine/cli.mjs gained a try/catch — E5.3(f)/(g)\'s exit-code surface moved and both cases need re-deriving')
+})
+
 // ================================================================================
 // GROUP 1 — gate verdicts (AC3) and edge traversal (AC2.1-2.3)
 // ================================================================================
@@ -1572,11 +1664,11 @@ await test('E4.6/AC4: advance() derives no in-repo default state path, and every
 // document has the right SKELETON (readable, parseable, an object, the right version,
 // the closed key set) and never looks at what the fields hold. So a nine-key document
 // with `history: null` loads, and dies one layer down inside the executor as a raw
-// `TypeError: state.history is not iterable` (engine/flow.mjs:264) — while one with
-// `counters: null` does not die at all: `{...null}` is `{}` (engine/flow.mjs:239), so
+// `TypeError: state.history is not iterable` (engine/flow.mjs:279) — while one with
+// `counters: null` does not die at all: `{...null}` is `{}` (engine/flow.mjs:254), so
 // the resume silently restarts on a fresh cap budget. That second mode fails OPEN and
-// is the graver of the two, because it defeats exactly the property
-// engine/run-state.mjs:11-12 declares the module exists to enforce. E4.14 is its
+// is the graver of the two, because it defeats exactly the property `loadState()`
+// (engine/run-state.mjs) declares the module exists to enforce. E4.14 is its
 // behavioural witness; E4.13 is the named TypeError's.
 //
 // Oracle discipline (verification design §3.4). The ACCEPTED side is derived from
@@ -1682,7 +1774,7 @@ await test('E4.7/AC4 (cycle 2): the reviewer\'s named document — nine keys, ri
   const { doc, refusal } = loadOutcome(writeDoc(dir, 'history-null.json', { ...goodDoc(), history: null }))
   assert.ok(refusal,
     `the document was ACCEPTED and returned (history = ${JSON.stringify(doc && doc.history)}) — `
-    + 'the failure is deferred into the executor, where it surfaces as a raw TypeError at engine/flow.mjs:264')
+    + 'the failure is deferred into the executor, where it surfaces as a raw TypeError at engine/flow.mjs:279')
   assert.equal(refusal.code, 'state-corrupt', 'the refusal must keep the code every existing caller reads')
   assert.equal(refusal.name, 'StateCorruptError')
   assert.ok(refusal instanceof RS.StateCorruptError)
@@ -1725,7 +1817,7 @@ await test('E4.8/AC4 (cycle 2): EVERY field is type-checked, not just history �
 await test('E4.9/AC4 (cycle 2): counter VALUES are typed, not only the counters container — a forged budget is refused', () => {
   const dir = tmpRoot()
   // Neither of these raises anywhere downstream today: '999' coerces at the
-  // `spent >= capValue(...)` compare (engine/flow.mjs:242) and forges exhaustion,
+  // `spent >= capValue(...)` compare (engine/flow.mjs:257) and forges exhaustion,
   // while -5 makes `spent + 1` count DOWN and enlarges the budget. Both are the
   // fail-open class one level below `counters: null`, so a container-only check
   // leaves the worse half of the finding open.
@@ -1858,9 +1950,9 @@ await test('E4.14/AC4 (cycle 2): counters: null is refused — unrefused it fail
   assert.ok(intactLast && intactLast.exhausted, 'precondition: a resume carrying the spent budget must refuse the retry')
 
   // The same document with one field corrupted. Nothing downstream raises: `{...null}`
-  // is `{}` (engine/flow.mjs:239), so the run continues on a budget that was already
-  // spent — the failure mode engine/run-state.mjs:11-12 names as the reason the module
-  // exists, and the fail-OPEN sibling of the history: null TypeError.
+  // is `{}` (engine/flow.mjs:254), so the run continues on a budget that was already
+  // spent — the failure mode `loadState()` (engine/run-state.mjs) names as the reason
+  // the module exists, and the fail-OPEN sibling of the history: null TypeError.
   const { doc, refusal } = loadOutcome(writeDoc(dir, 'counters-null.json', { ...spent, counters: null }))
   let resumed = null
   if (!refusal) {
@@ -2071,8 +2163,8 @@ const ABSENT = Symbol('absent')
 const WITNESS_FORMS = Object.freeze([...WITNESSES, ABSENT])
 const witnessWord = (w) => (w === ABSENT ? 'absent' : tagOf(w))
 
-// Parent containers a real run persists (engine/flow.mjs:232 for `pending`,
-// engine/flow.mjs:271 for `halt`), so a nested witness perturbs an otherwise
+// Parent containers a real run persists (engine/flow.mjs:247 for `pending`,
+// engine/flow.mjs:237 for `halt`), so a nested witness perturbs an otherwise
 // legitimate document rather than one this case invented.
 const delegatingDoc = () => ({
   ...goodDoc(), step: 'gate_plan', status: 'delegating',
@@ -2230,6 +2322,26 @@ function unenforcedRowFault(row) {
   return null
 }
 
+// M10 (GATE:QUALITY cycle 3). A clause LABEL must be checkable against the engine's
+// actual treatment of the path, not merely present: relabelling `halt.reason` from R2
+// to R3 previously survived green, because the only clause assertion ran one way
+// (declared ⇒ R3) and said nothing about a row the declaration does not carry.
+//
+// The discriminator is a MEASUREMENT, not a second table. Place a type-nonsense value
+// at the path and load the document:
+//   REFUSED  → the TYPE is enforced there, so only the value DOMAIN is open = R3
+//   ACCEPTED → nothing about the value is enforced there at all               = R2
+// R1 is inadmissible in this table by construction — R1 means enforced, and this is the
+// unenforced half — so it is reported as a contradiction rather than allowed through.
+const clauseFault = (row, typeEnforced) => {
+  const expected = typeEnforced ? 'R3' : 'R2'
+  if (row.clause === expected) return null
+  return `records clause ${JSON.stringify(row.clause)}, but a type-nonsense witness at this path is `
+    + (typeEnforced
+      ? 'REFUSED — the type IS enforced here, so what is open is the value domain (R3)'
+      : 'ACCEPTED — nothing about the value is enforced here, so this is a pass-through (R2)')
+}
+
 // A document carrying a deliberately odd value at an unenforced path. Pattern
 // segments are resolved generically — `*` is an arbitrary (undeclared) map key,
 // `*.value` the magnitude stored under a declared one, `[]` one array element — so a
@@ -2240,8 +2352,11 @@ function unenforcedWitnessDoc(path, value) {
   const [head, ...rest] = segs
   const key = rest.join('.')
   if (head === 'counters') {
-    if (key === '') return { ...doc, counters: { 'gate_plan.retry': 1 } }
-    return { ...doc, counters: key === '*' ? { 'no-such-declared-cap-key': 1 } : { 'gate_plan.retry': 0 } }
+    // The value is carried through rather than hardcoded: clause (iv) below probes the
+    // same path with a type-NONSENSE witness, and a builder that ignored its argument
+    // would answer "loads" for every counters row regardless of what was placed there.
+    if (key === '') return { ...doc, counters: { 'gate_plan.retry': value } }
+    return { ...doc, counters: key === '*' ? { 'no-such-declared-cap-key': value } : { 'gate_plan.retry': value } }
   }
   if (head === 'history') {
     if (key === '') return { ...doc, history: [] }
@@ -2538,6 +2653,17 @@ await test('E4.24/AC-C3-3 (cycle 3): the UNENFORCED half is declared, honest, an
   assert.ok(openRows > 0, 'precondition: the unenforced half must carry at least one genuinely open path')
   assert.deepEqual(overRejected, [], `rows the declaration calls open that the loader in fact refuses:\n        ${overRejected.join('\n        ')}`)
 
+  // (iv) THE CLAUSE LABEL IS EARNED, not merely present (M10). Runs over every row,
+  // including the ones the declaration does not carry — which is exactly the direction
+  // the earlier check could not see, and where the surviving mutant lived.
+  const mislabelled = []
+  for (const r of rows) {
+    const probe = loadOutcome(writeDoc(dir, `clause-${r.path.replace(/[^\w]/g, '_')}.json`, unenforcedWitnessDoc(r.path, true)))
+    const fault = clauseFault(r, !!probe.refusal)
+    if (fault !== null) mislabelled.push(`${r.path} ${fault}`)
+  }
+  assert.deepEqual(mislabelled, [], `rows whose clause label contradicts the engine's treatment of the path:\n        ${mislabelled.join('\n        ')}`)
+
   // (iii) the stated reason is TRUE, not asserted: the measured executor consequence
   // of a witness at each unenforced path is benign or typed. For the R3 rows whose
   // TYPE is enforced this is the substantive half — it is what proves the fault is
@@ -2564,7 +2690,7 @@ await test('E4.25/AC-C3 (cycle 3): the reviewer\'s witness — pending: {} — i
   for (const [why, doc, path] of rows) {
     const { doc: got, refusal } = loadOutcome(writeDoc(dir, `witness-${path}-${why.length}.json`, doc))
     assert.ok(refusal, `${why}: ACCEPTED (pending = ${JSON.stringify(got && got.pending)}) — the document reaches the executor, `
-      + 'which dereferences state.pending.step at engine/flow.mjs:288 and throws a raw, unnamed Error one layer below the boundary that must refuse it')
+      + 'which dereferences state.pending.step at engine/flow.mjs:303 and throws a raw, unnamed Error one layer below the boundary that must refuse it')
     assert.equal(refusal.code, 'state-corrupt', `${why}: the refusal must keep the code every existing caller reads`)
     assert.ok(refusal instanceof RS.StateCorruptError, `${why}: the refusal must be the typed load-boundary error`)
     assert.match(refusal.detail, new RegExp(`field "${path.replace('.', '\\.')}" is `),
@@ -2751,6 +2877,18 @@ await test('E4.31/AC-C3-2 (cycle 3): the declaration-level mutation battery — 
   const badClause = { ...RS.STATE_UNENFORCED[0], clause: 'R9' }
   assert.ok(unenforcedRowFault(badClause) !== null, 'mutant survives — a row citing a clause the rule does not define is accepted')
 
+  // M10's mutants, both directions. A clause id that is merely well-formed says
+  // nothing; these are the relabellings that used to survive green.
+  const r2row = RS.STATE_UNENFORCED.find((r) => r.clause === 'R2')
+  const r3row = RS.STATE_UNENFORCED.find((r) => r.clause === 'R3')
+  assert.ok(r2row && r3row, 'precondition: the table must carry both clause forms for the relabelling mutants to mean anything')
+  assert.ok(clauseFault({ ...r2row, clause: 'R3' }, false) !== null,
+    'mutant survives — a pass-through path relabelled R3 is accepted, so the label claims a type constraint that does not exist')
+  assert.ok(clauseFault({ ...r3row, clause: 'R2' }, true) !== null,
+    'mutant survives — a type-enforced path relabelled R2 is accepted, so the label understates what the contract holds')
+  assert.ok(clauseFault({ ...r2row, clause: 'R1' }, false) !== null,
+    'mutant survives — R1 means ENFORCED and cannot appear in the unenforced half at all')
+
   // Stated limit, not overclaimed: mutants INSIDE the loader (dropping the `shape`
   // recursion, recursing when value === null, dropping the nested .sort(),
   // substituting describeType at depth, reverting StepResolutionError to a bare
@@ -2862,9 +3000,9 @@ await test('E4.34/AC-C3-1 (cycle 3): the write side mirrors the VERSION check to
   const path = join(dir, 'version.json')
   // Measured on a clean tree at b6377f6, and the reason this case exists: saveState
   // ACCEPTS and writes { ...good, version: 2 }, while loadState on the very same file
-  // throws StateVersionError. So engine/run-state.mjs:74-76's "nothing can be written
-  // that cannot be read back" is false as shipped — `version` is admitted by a branch
-  // at :118 that sits OUTSIDE the declaration schemaFault() walks, and the write side
+  // throws StateVersionError. So the header's "nothing can be written that cannot be
+  // read back" claim is false as shipped — `version` is admitted by a branch inside
+  // `loadState()` that sits OUTSIDE the declaration `schemaFault()` walks, and the write side
   // has no mirror of it. This case pins the resolution: the write side refuses it.
   // The alternative resolution — merely RECORDING the asymmetry in the declaration —
   // is rejected here on purpose: it documents the hole rather than closing it, and
@@ -3062,7 +3200,8 @@ await test('E5.3(f)/AC4 (cycle 2): a CLI resume from a wrong-typed document fail
 
 await test('E5.3(g)/AC-C3-5 (cycle 3): a CLI resume that cannot resolve its step stops TYPED, and the reviewer\'s witness stops at the LOAD boundary', () => {
   const dir = tmpRoot()
-  // Constraints, measured rather than assumed (engine/cli.mjs:20-38 has no try/catch):
+  // Constraints, measured rather than assumed (`engine/cli.mjs` contains no try/catch
+  // anywhere — asserted mechanically by E6.7 rather than left as a comment):
   // (i) exit != 0 is asserted, never a DISTINCT exit code — both the corrupt-state
   // child and the effects-not-wired child exit 1, which is why E5.3(f) already
   // discriminates on stderr; (ii) no catch may be added to cli.mjs to make this case
