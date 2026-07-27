@@ -1556,6 +1556,456 @@ await test('E4.6/AC4: advance() derives no in-repo default state path, and every
 })
 
 // ================================================================================
+// GROUP 4 (cycle 2) — the load boundary checks FIELD VALUES, not only the key set
+// ================================================================================
+//
+// Authored from .autoflow/issue-4-verification-design.md (cycle 2) §2, against the
+// acceptance criteria — not against an implementation. The gap: loadState() proves a
+// document has the right SKELETON (readable, parseable, an object, the right version,
+// the closed key set) and never looks at what the fields hold. So a nine-key document
+// with `history: null` loads, and dies one layer down inside the executor as a raw
+// `TypeError: state.history is not iterable` (engine/flow.mjs:264) — while one with
+// `counters: null` does not die at all: `{...null}` is `{}` (engine/flow.mjs:239), so
+// the resume silently restarts on a fresh cap budget. That second mode fails OPEN and
+// is the graver of the two, because it defeats exactly the property
+// engine/run-state.mjs:11-12 declares the module exists to enforce. E4.14 is its
+// behavioural witness; E4.13 is the named TypeError's.
+//
+// Oracle discipline (verification design §3.4). The ACCEPTED side is derived from
+// documents real runs persist (acceptanceCorpus below); the REJECTED side is a fixed
+// witness literal in the PROSE_SOURCED shape. No case reads STATE_FIELDS[key].ok or
+// .expected — that is the tautology in which a wrong predicate satisfies its own
+// oracle. Iterating Object.keys(STATE_FIELDS) to GENERATE an input is permitted and
+// used once, by the totality case (E4.18).
+
+// The nine-key document a real run would accept — the same fixture the cycle-1
+// group-4 cases build (:1496), rebuilt per call so a case can mutate one field
+// without sharing a reference with another.
+const goodDoc = () => ({
+  version: RS.STATE_VERSION, issue: '#4', step: 'preflight', counters: {}, history: [],
+  pending: null, status: 'running', terminal: null, halt: null,
+})
+
+function writeDoc(dir, name, doc) {
+  const p = join(dir, name)
+  writeFileSync(p, JSON.stringify(doc))
+  return p
+}
+
+// The load result as DATA rather than as a throw, so a case can report what the
+// executor then did with an accepted document. A case that could only assert
+// `assert.throws` would state that the refusal is missing but never what the missing
+// refusal costs — which is the whole of E4.13 and E4.14.
+function loadOutcome(p) {
+  try {
+    return { doc: RS.loadState(p), refusal: null }
+  } catch (e) {
+    return { doc: null, refusal: e }
+  }
+}
+
+// The runtime type tag of a value: `typeof` collapses null and arrays into 'object',
+// and those are the two shapes this cycle is about.
+const tagOf = (v) => (v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v)
+
+// The ACCEPTANCE corpus — documents real executor runs persist. Every "this must
+// still load" expectation below is derived from here, never from the engine's own
+// table, so the characteristic defect of a new validation layer (over-rejection) is
+// caught by behaviour rather than by agreement with the thing under test.
+let _corpus = null
+function acceptanceCorpus() {
+  if (_corpus) return _corpus
+  const sp = spec()
+  const dir = tmpRoot()
+  const docs = []
+  const keep = (p, s) => docs.push(s)
+  runFlow(sp, { start: 'preflight', maxSteps: 80, statePath: join(dir, 'c1.json'), persist: keep, outcomes: mainLine() })
+  runFlow(sp, { start: 'gate_plan', statePath: join(dir, 'c2.json'), persist: keep, outcomes: oneShot('gate_plan', 'pass') })
+  runFlow(sp, { start: 'validate', statePath: join(dir, 'c3.json'), persist: keep, outcomes: oneShot('validate', 'incomplete') })
+  const term = runFlow(sp, { start: 'preflight', maxSteps: 40, statePath: join(dir, 'c4.json'), persist: keep, outcomes: mainLine({ verify: 'test-issue' }) })
+  docs.push(term.state)
+  _corpus = docs
+  return _corpus
+}
+
+// The eight FIELD keys, derived from a document a real run produced: the closed key
+// set minus `version`. `version` carries its own rejection (StateVersionError, raised
+// before any field pass), so it is a row of the KEY set and not of the field layer;
+// its precedence is asserted by E4.10 instead.
+const fieldKeys = () => Object.keys(acceptanceCorpus()[0]).filter((k) => k !== 'version').sort()
+
+// The type tags each field is OBSERVED to carry across the corpus. A lower bound
+// derived from behaviour — which is what makes "this shape must still load" an
+// independent expectation rather than a restatement of the predicate under test.
+function acceptedTags() {
+  const acc = {}
+  for (const k of fieldKeys()) acc[k] = new Set()
+  for (const d of acceptanceCorpus()) for (const k of fieldKeys()) acc[k].add(tagOf(d[k]))
+  return acc
+}
+
+// Six top-level type tags, authored as a design statement in the PROSE_SOURCED shape
+// (:20-25). A key's negative row set is WITNESSES minus the tags the corpus proves it
+// legitimately carries, computed at run time — so no per-field expectation is authored.
+const WITNESSES = Object.freeze([null, true, 42, 'x', [], {}])
+
+// PROSE_SOURCED: the expected-type phrase each field's rejection must report,
+// transcribed from the feature design (.autoflow/issue-4-feature-design.md §2.1).
+// Deliberately NOT read off RS.STATE_FIELDS[key].expected: their AGREEMENT with the
+// table is the assertion, not its premise (verification design §3.4).
+const EXPECTED_PHRASE = Object.freeze({
+  counters: 'an object whose values are non-negative integers',
+  halt: 'null or an object',
+  history: 'an array',
+  issue: 'a string',
+  pending: 'null or an object',
+  status: 'a string',
+  step: 'a string',
+  terminal: 'null or a string',
+})
+
+// What the message must call the offending value, authored from the same design
+// section rather than imported from the engine's describe(): 'null' and 'an array'
+// are spelled out because `typeof` reports both as 'object'.
+const actualWord = (v) => (v === null ? 'null' : Array.isArray(v) ? 'an array' : typeof v)
+
+await test('E4.7/AC4 (cycle 2): the reviewer\'s named document — nine keys, right version, history: null — is refused typed at the load boundary', () => {
+  const dir = tmpRoot()
+  const { doc, refusal } = loadOutcome(writeDoc(dir, 'history-null.json', { ...goodDoc(), history: null }))
+  assert.ok(refusal,
+    `the document was ACCEPTED and returned (history = ${JSON.stringify(doc && doc.history)}) — `
+    + 'the failure is deferred into the executor, where it surfaces as a raw TypeError at engine/flow.mjs:264')
+  assert.equal(refusal.code, 'state-corrupt', 'the refusal must keep the code every existing caller reads')
+  assert.equal(refusal.name, 'StateCorruptError')
+  assert.ok(refusal instanceof RS.StateCorruptError)
+})
+
+await test('E4.8/AC4 (cycle 2): EVERY field is type-checked, not just history — the wrong-type witness matrix', () => {
+  const dir = tmpRoot()
+  const accepted = acceptedTags()
+  const keys = fieldKeys()
+  assert.ok(keys.length > 1, 'precondition: the matrix must span the whole field layer, not one key')
+  for (const key of keys) {
+    assert.ok(EXPECTED_PHRASE[key], `no expected-type phrase is transcribed for the field "${key}"`)
+  }
+  const survived = []
+  let rows = 0
+  for (const key of keys) {
+    for (const w of WITNESSES) {
+      // A tag a real run persists for this field is not a negative row — refusing it
+      // would be the over-rejection failure, which E4.12 owns.
+      if (accepted[key].has(tagOf(w))) continue
+      rows++
+      const { refusal } = loadOutcome(writeDoc(dir, `wrong-${key}-${tagOf(w)}.json`, { ...goodDoc(), [key]: w }))
+      if (!refusal) { survived.push(`${key}: ${tagOf(w)}`); continue }
+      assert.equal(refusal.code, 'state-corrupt', `${key}: ${tagOf(w)} — the refusal must keep the existing code`)
+      // Driven from the LOOP VARIABLE and anchored on the key in quoted position, so a
+      // fix that emits one fixed string fails on every row and another field's message
+      // cannot satisfy this one.
+      assert.match(refusal.detail, new RegExp(`field "${key}" is `),
+        `${key}: ${tagOf(w)} — the refusal does not name the field that was mutated: ${refusal.detail}`)
+      assert.ok(refusal.detail.includes(actualWord(w)),
+        `${key}: ${tagOf(w)} — the refusal does not report the ACTUAL type: ${refusal.detail}`)
+      assert.ok(refusal.detail.includes(EXPECTED_PHRASE[key]),
+        `${key}: ${tagOf(w)} — the refusal does not report the EXPECTED type: ${refusal.detail}`)
+    }
+  }
+  assert.ok(rows > keys.length, 'precondition: the matrix must carry more than one witness per key')
+  assert.deepEqual(survived, [], `wrong-typed fields the loader accepted: ${survived.join(', ')}`)
+})
+
+await test('E4.9/AC4 (cycle 2): counter VALUES are typed, not only the counters container — a forged budget is refused', () => {
+  const dir = tmpRoot()
+  // Neither of these raises anywhere downstream today: '999' coerces at the
+  // `spent >= capValue(...)` compare (engine/flow.mjs:242) and forges exhaustion,
+  // while -5 makes `spent + 1` count DOWN and enlarges the budget. Both are the
+  // fail-open class one level below `counters: null`, so a container-only check
+  // leaves the worse half of the finding open.
+  for (const [name, value] of [['string', '999'], ['negative', -5]]) {
+    const { refusal } = loadOutcome(writeDoc(dir, `counters-${name}.json`, { ...goodDoc(), counters: { 'gate_plan.retry': value } }))
+    assert.ok(refusal, `counters: { 'gate_plan.retry': ${JSON.stringify(value)} } was accepted — a forged budget survives the load boundary`)
+    assert.equal(refusal.code, 'state-corrupt')
+    assert.match(refusal.detail, /field "counters" is /)
+  }
+})
+
+await test('E4.10/AC4 (cycle 2): the new field pass does not re-classify the rejections cycle 1 pinned', () => {
+  const dir = tmpRoot()
+  // A wrong-typed field alone reports the field — the layer exists.
+  const only = loadOutcome(writeDoc(dir, 'wrong-only.json', { ...goodDoc(), status: 42 }))
+  assert.ok(only.refusal, 'a wrong-typed field on an otherwise well-formed document was accepted')
+  assert.equal(only.refusal.code, 'state-corrupt')
+  assert.match(only.refusal.detail, /field "status" is /)
+
+  // Version skew still wins: a future schema version may legitimately carry different
+  // field types, so a skewed document must keep reporting state-version (:1503).
+  const skew = loadOutcome(writeDoc(dir, 'skew-and-wrong.json', { ...goodDoc(), version: 'next', history: null }))
+  assert.ok(skew.refusal)
+  assert.equal(skew.refusal.code, 'state-version',
+    'the field pass ran before the version check and silently re-classified a version skew as corruption')
+
+  // The key set still wins: the field pass is defined only over the closed key set,
+  // so a document whose real defect is an unknown or a missing key must report that.
+  const extra = loadOutcome(writeDoc(dir, 'extra-and-wrong.json', { ...goodDoc(), surpriseField: 1, history: null }))
+  assert.ok(extra.refusal)
+  assert.equal(extra.refusal.code, 'state-corrupt')
+  assert.match(extra.refusal.detail, /key set/, 'an unknown key must still be reported as a key-set defect')
+  const missing = goodDoc()
+  delete missing.halt
+  const gone = loadOutcome(writeDoc(dir, 'missing-and-wrong.json', { ...missing, history: null }))
+  assert.ok(gone.refusal)
+  assert.match(gone.refusal.detail, /key set/, 'a missing key must still be reported as a key-set defect')
+})
+
+await test('E4.11/AC4 (cycle 2): the refusal distinguishes null from an object, and reports a deterministic first offender', () => {
+  const dir = tmpRoot()
+  const asNull = loadOutcome(writeDoc(dir, 'history-null-2.json', { ...goodDoc(), history: null }))
+  const asObj = loadOutcome(writeDoc(dir, 'history-object.json', { ...goodDoc(), history: {} }))
+  assert.ok(asNull.refusal && asObj.refusal, 'both wrong-typed shapes must be refused')
+  // A typeof-only message collapses both to 'object', which is what makes the two most
+  // likely corruption shapes indistinguishable to whoever reads the stderr line.
+  assert.notEqual(asNull.refusal.detail, asObj.refusal.detail,
+    'null and {} produced the SAME message — the operator cannot tell which corruption occurred')
+  assert.ok(asNull.refusal.detail.includes('null'), `a null field must be reported as null: ${asNull.refusal.detail}`)
+  assert.ok(asObj.refusal.detail.includes('object'), `an object field must be reported as an object: ${asObj.refusal.detail}`)
+
+  // Two bad fields: the reported one is the sorted-first of the keys THIS CASE mutated,
+  // computed here rather than read off the engine's table. A standing guard — while the
+  // table is authored in sorted order this cannot discriminate a sort-less loop; its
+  // trigger is the removal of the loop's own ordering once the table has drifted.
+  // Reordering the table's rows is deliberately NOT a regression.
+  const mutated = ['counters', 'history']
+  const both = loadOutcome(writeDoc(dir, 'two-bad.json', { ...goodDoc(), counters: null, history: null }))
+  assert.ok(both.refusal, 'a document with two wrong-typed fields was accepted')
+  assert.match(both.refusal.detail, new RegExp(`field "${[...mutated].sort()[0]}" is `),
+    `the first-reported field is not the alphabetically first offender: ${both.refusal.detail}`)
+  assert.ok(!both.refusal.detail.includes(`field "${[...mutated].sort()[1]}"`),
+    'exactly one field is reported, so the report is deterministic')
+})
+
+await test('E4.12/AC4 (cycle 2): every document a real run persists still loads, deep-equal — the refusal is not over-broad', () => {
+  const dir = tmpRoot()
+  const docs = acceptanceCorpus()
+  assert.ok(docs.length > 3, 'precondition: the corpus must span several persisted hops')
+  docs.forEach((s, i) => {
+    const wire = JSON.parse(JSON.stringify(s))
+    const { doc, refusal } = loadOutcome(writeDoc(dir, `corpus-${i}.json`, s))
+    assert.ok(!refusal, `a document a real run persisted was refused: ${refusal && refusal.detail}`)
+    assert.deepEqual(doc, wire, 'the round-trip must stay a deep-equal, not a spot check')
+  })
+  // The corpus must actually EXHIBIT the non-null and non-empty forms. Without this the
+  // accepted set degrades silently — a corpus that never produced a non-null `pending`
+  // would derive "pending is always null" and turn a correct loader's acceptance of a
+  // delegating document into a rejection row.
+  const some = (f, what) => assert.ok(docs.some(f), `the corpus exhibits no ${what} — every expectation derived from it is weaker than it reads`)
+  some((d) => d.pending !== null, 'non-null pending')
+  some((d) => d.halt !== null, 'non-null halt')
+  some((d) => d.terminal !== null, 'non-null terminal')
+  some((d) => typeof d.issue === 'string' && d.issue !== '', 'non-empty string issue')
+  some((d) => Object.keys(d.counters).length > 0, 'non-empty counters')
+  some((d) => d.history.length > 0, 'non-empty history')
+})
+
+await test('E4.13/AC4 (cycle 2): an embedder resume never reaches the executor — the raw TypeError is replaced by a typed refusal', () => {
+  const sp = spec()
+  const dir = tmpRoot()
+  const path = writeDoc(dir, 'resume-history-null.json', { ...goodDoc(), step: 'gate_plan', history: null })
+  let hops = 0
+  // The fully wired two-hop form. An unwired env dies earlier at missing-slot, so a
+  // case built on one naive advance() would witness the harness's artifact map rather
+  // than the loader (the pattern at :632-636).
+  const twoHop = (state) => {
+    const base = { effects: {}, artifacts: artifactsMap(sp), persist: () => {}, statePath: path }
+    hops++
+    const first = FLOW.advance(sp, state, base)
+    assert.equal(first.event.kind, 'delegate', 'precondition: hop 1 must raise the delegation')
+    hops++
+    return FLOW.advance(sp, first.state, { ...base, delegationOutput: { scores: PASSING_SCORES } })
+  }
+  const { doc, refusal } = loadOutcome(path)
+  let downstream = null
+  if (!refusal) { try { twoHop(doc) } catch (e) { downstream = e } }
+  assert.ok(refusal,
+    'the document was ACCEPTED at the load boundary and the executor was entered; it then raised '
+    + `${downstream && downstream.name}: ${downstream && downstream.message} — a raw language error, `
+    + 'thrown one layer below the boundary that is supposed to refuse it')
+  assert.equal(refusal.code, 'state-corrupt')
+  assert.ok(!(refusal instanceof TypeError), 'the refusal must be the typed load-boundary error, not a language error')
+  assert.equal(hops, 0, 'the executor must never be entered with an unvalidated document')
+})
+
+await test('E4.14/AC4 (cycle 2): counters: null is refused — unrefused it fails OPEN, restarting the run on a fresh cap budget', () => {
+  const sp = spec()
+  const dir = tmpRoot()
+  const cap = RT.capValue(sp, 'gate_plan.retry')
+  const spent = { ...goodDoc(), step: 'gate_plan', counters: { 'gate_plan.retry': cap } }
+  // The reference behaviour, measured rather than authored: with the budget intact on
+  // disk, the resumed run refuses the next retry and routes to the declared exhaustion
+  // target. This is the behaviour the corrupted document must not be able to escape.
+  const intact = runFlow(sp, {
+    state: JSON.parse(JSON.stringify(spent)), maxSteps: 10, statePath: join(dir, 'intact.json'),
+    persist: () => {}, outcomes: oneShot('gate_plan', 'fail'),
+  })
+  const intactLast = intact.trace[intact.trace.length - 1]
+  assert.ok(intactLast && intactLast.exhausted, 'precondition: a resume carrying the spent budget must refuse the retry')
+
+  // The same document with one field corrupted. Nothing downstream raises: `{...null}`
+  // is `{}` (engine/flow.mjs:239), so the run continues on a budget that was already
+  // spent — the failure mode engine/run-state.mjs:11-12 names as the reason the module
+  // exists, and the fail-OPEN sibling of the history: null TypeError.
+  const { doc, refusal } = loadOutcome(writeDoc(dir, 'counters-null.json', { ...spent, counters: null }))
+  let resumed = null
+  if (!refusal) {
+    resumed = runFlow(sp, {
+      state: doc, maxSteps: 10, statePath: join(dir, 'corrupt.json'),
+      persist: () => {}, outcomes: oneShot('gate_plan', 'fail'),
+    })
+  }
+  const last = resumed && resumed.trace[resumed.trace.length - 1]
+  assert.ok(refusal,
+    'counters: null was ACCEPTED and the resume ran on: exhausted = '
+    + `${last ? !!last.exhausted : 'n/a'} where the intact document refuses, counters = `
+    + `${JSON.stringify(resumed && resumed.state.counters)} — the ${cap} spent retries were `
+    + 'silently discarded and nothing was raised anywhere')
+  assert.equal(refusal.code, 'state-corrupt')
+  assert.match(refusal.detail, /field "counters" is null/)
+})
+
+await test('E4.15/AC4 (cycle 2): saveState refuses a document its own loader would refuse, BEFORE the temp write', () => {
+  const sp = spec()
+  const dir = tmpRoot()
+  const path = join(dir, 'run-4.json')
+  assert.throws(() => RS.saveState(path, { ...goodDoc(), history: null }), (e) => e.code === 'state-corrupt',
+    'the engine must not be able to persist a document it cannot read back')
+  // Ordering is the assertion, not a detail: a check placed one line late leaves
+  // run-4.json.tmp in the state root and regresses the atomicity property at :1539.
+  assert.deepEqual(readdirSync(dir), [], 'the refused save left a temp file in the state root')
+  const missing = goodDoc()
+  delete missing.halt
+  assert.throws(() => RS.saveState(path, missing), (e) => e.code === 'state-corrupt', 'the key set is checked on the write side too')
+
+  RS.saveState(path, goodDoc())
+  const before = readFileSync(path, 'utf8')
+  assert.throws(() => RS.saveState(path, { ...goodDoc(), counters: null }), (e) => e.code === 'state-corrupt')
+  assert.equal(readFileSync(path, 'utf8'), before, 'the refused save overwrote the previous document')
+  assert.deepEqual(readdirSync(dir), ['run-4.json'], 'the refused save left a temp file beside the previous document')
+
+  // The embedder default path, whose failure this refusal exists to catch: with `issue`
+  // omitted, JSON.stringify drops the key and the run persists an 8-key document that
+  // its own loader refuses at the next resume. The refusal must land at the WRITE that
+  // caused it, naming the field.
+  let e5 = null
+  assert.throws(() => RS.saveState(join(dir, 'default-path.json'), FLOW.initialState(sp, { start: 'preflight' })),
+    (e) => { e5 = e; return true },
+    'initialState() with issue omitted still persists a document that cannot be loaded back')
+  assert.equal(e5.code, 'state-corrupt')
+  assert.match(e5.detail, /field "issue" is undefined/)
+})
+
+await test('E4.16/AC4 (cycle 2): one contract, two consumers — both directions refuse the same document with the same code', () => {
+  const dir = tmpRoot()
+  const bad = { ...goodDoc(), pending: 7 }
+  let write = null
+  assert.throws(() => RS.saveState(join(dir, 'w.json'), bad), (e) => { write = e; return true },
+    'the writer accepted a document the reader must refuse')
+  const read = loadOutcome(writeDoc(dir, 'r.json', bad))
+  assert.ok(read.refusal, 'the reader accepted a document the writer refuses')
+  assert.equal(write.code, read.refusal.code, 'the two directions must agree on the CODE')
+
+  // Deliberately not asserted at the DETAIL level. `issue: undefined` is the input that
+  // proves they cannot agree there: JSON.stringify erases the key, so the writer sees a
+  // bad FIELD while the reader sees a missing KEY. Both refuse; a detail-level
+  // equivalence assertion would fail a CORRECT implementation.
+  const undef = { ...goodDoc(), issue: undefined }
+  let write2 = null
+  assert.throws(() => RS.saveState(join(dir, 'w2.json'), undef), (e) => { write2 = e; return true })
+  const read2 = loadOutcome(writeDoc(dir, 'r2.json', undef))
+  assert.ok(read2.refusal)
+  assert.equal(write2.code, read2.refusal.code)
+  assert.match(read2.refusal.detail, /key set/, 'the reader sees an 8-key document, so its defect is the key set')
+})
+
+await test('E4.17/AC4 (cycle 2): the write check rejects nothing a real run produces — the corpus through the REAL saveState port', () => {
+  const sp = spec()
+  const dir = tmpRoot()
+  const path = join(dir, 'run-4.json')
+  // Every scenario in this suite stubs `persist`, so a write check stricter than a real
+  // run's output would be invisible to all of them. This case wires the real port, so
+  // that cost surfaces here rather than after the implementation lands.
+  let hops = 0
+  const port = (p, s) => { hops++; RS.saveState(p, s) }
+  runFlow(sp, { start: 'preflight', maxSteps: 80, statePath: path, persist: port, outcomes: mainLine() })
+  runFlow(sp, { start: 'gate_plan', statePath: path, persist: port, outcomes: oneShot('gate_plan', 'pass') })
+  runFlow(sp, { start: 'validate', statePath: path, persist: port, outcomes: oneShot('validate', 'incomplete') })
+  assert.ok(hops > 3, 'precondition: several real hops must have gone through the real write port')
+  assert.deepEqual(Object.keys(RS.loadState(path)).sort(), Object.keys(goodDoc()).sort())
+})
+
+await test('E4.18/AC4 (cycle 2): the type contract is TOTAL over the closed key set, and STATE_KEYS is still the nine-key set', () => {
+  const dir = tmpRoot()
+  // The derived constant must reproduce the value this suite pinned before any field
+  // table existed (:1399-1403, asserted over a document a real run produced). The
+  // expectation predates the table, so this is not the table asserting itself.
+  assert.deepEqual([...RS.STATE_KEYS].sort(),
+    ['counters', 'halt', 'history', 'issue', 'pending', 'status', 'step', 'terminal', 'version'])
+
+  assert.ok(RS.STATE_FIELDS && typeof RS.STATE_FIELDS === 'object',
+    'engine/run-state.mjs must export the per-field table, so totality is asserted by construction rather than by a hand-maintained list')
+  const tableKeys = Object.keys(RS.STATE_FIELDS).sort()
+  assert.deepEqual(tableKeys, fieldKeys(), 'the table must cover exactly the closed key set minus version')
+  // `true` is inadmissible under every row, so one generator covers the table
+  // exhaustively and a field added later without a working predicate fails HERE rather
+  // than passing unnoticed. The table supplies the case's INPUT only; the expectation
+  // ("refused, typed, naming the field") is authored, and .ok / .expected are not read.
+  for (const key of tableKeys) {
+    const { refusal } = loadOutcome(writeDoc(dir, `true-${key}.json`, { ...goodDoc(), [key]: true }))
+    assert.ok(refusal, `${key}: true was accepted — this field has no working admissibility predicate`)
+    assert.equal(refusal.code, 'state-corrupt')
+    assert.match(refusal.detail, new RegExp(`field "${key}" is `))
+  }
+})
+
+await test('E4.19/AC4 (cycle 2): the refusal stops where the design says it stops — the boundary forms still load', () => {
+  const dir = tmpRoot()
+  const g = goodDoc()
+  // A refusal layer's characteristic defect is over-reach, so the boundary is asserted
+  // rather than assumed. Each row below is a shape the design deliberately admits; a
+  // later, broader check must therefore be a decision rather than a drift.
+  const rows = [
+    ['history entries are not element-checked', { ...g, history: [{}, { anything: 1 }, { from: 'a', outcome: 'b', to: 'c' }] }],
+    ['pending is a nullable OBJECT', { ...g, pending: { step: 'gate_plan', roles: ['evaluator'], request: {} } }],
+    ['halt is a nullable OBJECT', { ...g, halt: { reason: 'incomplete', step: 'validate', detail: null } }],
+    ['terminal is a nullable STRING', { ...g, terminal: 'escalate' }],
+    ['the empty containers initialState() writes', { ...g, counters: {}, history: [] }],
+    ['populated counters', { ...g, counters: { 'gate_plan.retry': 3 } }],
+    ['counter KEY names are not validated', { ...g, counters: { 'not-a-declared-cap-key': 1 } }],
+  ]
+  rows.forEach(([why, doc], i) => {
+    const { refusal } = loadOutcome(writeDoc(dir, `boundary-${i}.json`, doc))
+    assert.ok(!refusal, `over-rejection — ${why}: ${refusal && refusal.detail}`)
+  })
+})
+
+await test('E4.20/AC4 (cycle 2): the rejection message reports the field and its types — it never echoes the untrusted VALUE', () => {
+  const dir = tmpRoot()
+  // The message is the only new externally visible surface, and it reaches stderr
+  // through engine/cli.mjs. It is safe by construction — the key comes from the trusted
+  // table, the type word from a fixed vocabulary, the expected phrase from the table —
+  // but nothing holds it there, so a later "improve the message" edit that appends the
+  // offending value would regress it silently. Held as a case.
+  const marker = 'UNTRUSTED-9f3c1a-VALUE'
+  const rows = [['history', marker], ['halt', marker], ['step', [marker]], ['counters', { [`${marker}-key`]: marker }]]
+  for (const [key, value] of rows) {
+    const { refusal } = loadOutcome(writeDoc(dir, `echo-${key}.json`, { ...goodDoc(), [key]: value }))
+    assert.ok(refusal, `${key}: the document was accepted`)
+    assert.match(refusal.detail, new RegExp(`field "${key}" is `), `${key}: the message must still be actionable`)
+    assert.ok(refusal.detail.includes(EXPECTED_PHRASE[key]), `${key}: the message must still report the expected type`)
+    assert.ok(!refusal.detail.includes(marker), `${key}: the detail echoes the untrusted value — ${refusal.detail}`)
+    assert.ok(!refusal.message.includes(marker), `${key}: the message echoes the untrusted value — ${refusal.message}`)
+  }
+})
+
+// ================================================================================
 // GROUP 5 — the non-interactive escalate protocol (AC5)
 // ================================================================================
 
@@ -1708,6 +2158,27 @@ await test('E5.3(d)/AC5: the CLI actually RAN persist and notify — not merely 
   assert.equal(rec.terminal, 'escalate')
   assert.equal(rec.statePath, path)
   assert.ok(!res.stdout.includes('{'), 'a stdout write would corrupt a caller parsing the harness ok/FAIL lines')
+})
+
+await test('E5.3(f)/AC4 (cycle 2): a CLI resume from a wrong-typed document fails at the LOAD boundary, not later at a wiring error', () => {
+  const dir = tmpRoot()
+  const path = join(dir, 'run-4-corrupt.json')
+  // `preflight` is pinned because the pre-refusal failure differs by step (preflight →
+  // effects-not-wired, gate_plan → missing-slot). The discriminator is that the failure
+  // moves EARLIER, to the loader — "stderr does not name TypeError" would be satisfied
+  // without any fix at all, since engine/cli.mjs:29 hardwires artifacts: {} and
+  // NO_EFFECTS and no reachable step gets as far as [...state.history].
+  writeFileSync(path, JSON.stringify({ ...goodDoc(), history: null }))
+  const res = runCli(path)
+  assert.match(res.stderr, /state-corrupt|StateCorruptError/,
+    'the child reported a downstream wiring error instead of the corrupt document that caused it')
+  assert.ok(!/effects-not-wired/.test(res.stderr),
+    'the child reached the executor, so the document was accepted at the load boundary')
+  // A load failure is not a terminal, so it is not routed through escalate() and carries
+  // no declared exit code — node's default 1. Pinned so a future re-route through
+  // escalate() (exit 2) fails loudly; it has no discriminating power by construction,
+  // since both the corrupt-state child and the effects-not-wired child exit 1.
+  assert.equal(res.status, 1)
 })
 
 await test('E5.4/AC5: notify receives a JSON-serializable RECORD, not a formatted string', () => {
