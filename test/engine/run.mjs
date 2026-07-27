@@ -3405,14 +3405,54 @@ await test('E4.39/AC-C4-OQ (cycle 4): the input boundary is DECLARED, TOTAL, and
   }
 })
 
+// A driving whose CONTROL makes no consequential progress cannot discriminate absence
+// from presence: absent, control and input then project identically and the row
+// classifies b-i whatever it declares, silently. This is the same class as cycle 3's
+// harness traps — a measurement that reports the harness as the subject's behaviour —
+// and it is asserted as a PRECONDITION on the driving, never absorbed into the
+// classifier. `absentVsControl`'s total order and its matchesControl-first precedence
+// are what make the buckets decidable and are deliberately left untouched.
+const controlIsVacuous = (v, doc) => sameProjection(consequential(v.control.after), consequential(doc))
+
+// The mechanical step the three mechanical rows are driven from, selected BY A STATED
+// PROPERTY rather than by position. Two properties, both load-bearing:
+//
+//   (1) its control run reaches a DECLARED OUTCOME — it transitions. The mechanical
+//       set is NOT homogeneous in this respect: `deliver`, `dispatch` and `validate`
+//       answer the suite's 'ready' effect record with a record that satisfies no
+//       declared outcome, so their control HALTS. A halt is consequential only when
+//       the document carries a pending record — `haltOn` writes
+//       `{status:'halted', pending:null, halt}` and none of those three is in the
+//       four-element projection once `pending` is already null — so a halt on a cold
+//       document is projection-inert and the driving cannot discriminate. The design's
+//       "a halt is NOT inert" holds conditionally, and this is the condition.
+//   (2) it declares no agents, so the driving exercises the plain mechanical path and
+//       stays clear of the delegating re-entry path E4.41 owns.
+//
+// The selection reads the CONTROL side only — the key supplied — which is not the
+// thing under test: the subject is the difference the ABSENCE makes. Choosing a
+// driving that can discriminate is not choosing its answer.
+function progressingMechanicalId(sp) {
+  for (const id of mechanicalIds(sp)) {
+    if (rolesOf(stepOf(sp, id)).length > 0) continue
+    const r = absentEnv(sp, { ...goodDoc(), step: id }, null)
+    if (!r.err && r.event && r.event.kind === 'transition') return id
+  }
+  return null
+}
+
 // The per-row driving table for E4.40. Each entry names the document, the key to
 // delete and the bucket the ROW must declare — never the bucket the run happens to
 // produce. Authored here rather than read off the declaration: the row supplies the
 // subject, this table supplies the expectation.
 function boundaryDrivings(sp) {
+  // The gate and delegated-non-gate sets are homogeneous for this purpose — every
+  // member's control advances — so the sorted first member carries no hidden
+  // dependency. The mechanical set is not, which is what `progressingMechanicalId`
+  // exists for.
   const delegated = delegatedNonGateOf(sp)[0]
   const gate = gateStepsOf(sp)[0]
-  const mech = mechanicalIds(sp)[0]
+  const mech = progressingMechanicalId(sp)
   return [
     { input: 'artifacts', site: 'advance:buildRequest', key: 'artifacts', bucket: 'b-ii',
       doc: { ...goodDoc(), step: delegated }, overrides: {} },
@@ -3438,6 +3478,9 @@ await test('E4.40/AC-C4-OQ (cycle 4): the classifier — every declared row\'s a
   // measured is a declaration resting on a comment — the exact failure E4.39/E4.40
   // exist to prevent.
   const drivings = boundaryDrivings(sp)
+  assert.ok(progressingMechanicalId(sp),
+    'no mechanical step both advances on the control record and declares no agents — the three mechanical rows have no '
+    + 'driving that can discriminate absence from presence, and picking one by index would hide that')
   const byKey = (r) => `${r.input}@${r.site}`
   const declaredRows = new Map(rows.map((r) => [byKey(r), r]))
   const failures = []
@@ -3445,6 +3488,12 @@ await test('E4.40/AC-C4-OQ (cycle 4): the classifier — every declared row\'s a
     const row = declaredRows.get(byKey(d))
     if (!row) { failures.push(`${byKey(d)}: the declaration carries no such row, so its admissibility is unmeasured`); continue }
     const v = absentVsControl(sp, d.doc, d.key, row, d.overrides)
+    if (controlIsVacuous(v, d.doc)) {
+      failures.push(`${byKey(d)}: VACUOUS DRIVING — the control run makes no consequential progress `
+        + `(${JSON.stringify(consequential(d.doc))} unchanged), so absence and presence are indistinguishable here `
+        + 'and the row would classify b-i whatever it declares. Drive it from a document whose control advances.')
+      continue
+    }
     if (v.bucket !== d.bucket) {
       failures.push(`${byKey(d)}: measured bucket ${JSON.stringify(v.bucket)}, expected ${d.bucket} `
         + `(matchesControl=${v.matchesControl} matchesInput=${v.matchesInput} stop=${JSON.stringify(v.stop)})`)
@@ -3526,6 +3575,10 @@ await test('E4.41/AC-C4-4 (cycle 4): the mechanical exception, measured over the
   for (const [why, record, control, wanted] of pairs) {
     const overrides = { effects: { handoff: () => record }, delegationOutput: control }
     const v = absentVsControl(sp, doc, 'delegationOutput', row, overrides)
+    if (controlIsVacuous(v, doc)) {
+      failures.push(`${why}: VACUOUS DRIVING — the control makes no consequential progress, so this record cannot witness what the absence changes`)
+      continue
+    }
     if (v.bucket !== wanted) {
       failures.push(`${why}: measured ${JSON.stringify(v.bucket)}, expected ${wanted} `
         + `(matchesControl=${v.matchesControl} matchesInput=${v.matchesInput} stop=${JSON.stringify(v.stop)})`)
