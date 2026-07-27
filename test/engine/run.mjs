@@ -124,21 +124,77 @@ const engineSources = () =>
   readdirSync(join(root, 'engine')).filter((f) => f.endsWith('.mjs')).map((f) => [f, readRepo(join('engine', f))])
 const gitShow = (rev) => execFileSync('git', ['show', rev], { cwd: root, encoding: 'utf8' })
 
-// The cycle's BASE commit — this branch's merge base with the default branch, not
-// HEAD. "What this cycle changed" has to be measured against the point the cycle
-// started from: measured against HEAD it empties the moment the cycle commits, which
-// would silently vacate both the reuse byte-compares (E2.3/E3.5) and the cap-literal
-// scan (E2.4) exactly when the code they guard arrives.
-const BASE = execFileSync('git', ['merge-base', 'HEAD', 'main'], { cwd: root, encoding: 'utf8' }).trim()
+// ---- the cycle's diff base ------------------------------------------------------
+//
+// BASE is the commit this cycle started from — the branch's merge base with the
+// default branch, NOT `HEAD`. "What this cycle changed" has to be measured from the
+// starting point: measured against `HEAD` the subject set empties the moment the
+// cycle commits, silently vacating both the reuse byte-compares (E2.3/E3.5) and the
+// cap-literal scan (E2.4) exactly when the code they guard arrives.
+//
+// Which ref names the default branch depends on the checkout, and git's DWIM does
+// NOT fall back from `main` to `origin/main` (its search order is refs/heads/,
+// refs/tags/, refs/remotes/, refs/remotes/<name>/HEAD — `refs/remotes/origin/main`
+// is not reachable as a bare `main`):
+//   - a developer clone has a local `main`;
+//   - an actions/checkout CI checkout has only `refs/remotes/origin/main`;
+//   - a shallow checkout may have neither, and no merge base at all.
+// So candidates are tried in order and the first that resolves wins. `origin/main`
+// comes first because it is the ref that tracks the real default branch; a local
+// `main` may sit behind it.
+//
+// If none resolves, resolution does NOT degrade to an empty subject set — that would
+// convert the three cases above into vacuous passes, which is precisely what BASE
+// exists to prevent. It records the failure and every case that needs a base fails
+// loudly with an actionable message, while the rest of the suite still runs (the
+// module must not abort at import with zero case lines).
+const BASE_CANDIDATES = ['origin/main', 'main', 'refs/remotes/origin/HEAD']
+
+const gitTry = (args) =>
+  execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+
+function resolveBase(candidates = BASE_CANDIDATES) {
+  const tried = []
+  for (const ref of candidates) {
+    try {
+      const sha = gitTry(['merge-base', 'HEAD', ref])
+      if (sha) return { sha, ref, tried }
+      tried.push(`${ref} (no merge base)`)
+    } catch (e) {
+      const why = String(e.stderr || e.message).split('\n')[0].trim()
+      tried.push(`${ref} (${why || 'unresolved'})`)
+    }
+  }
+  return { sha: null, ref: null, tried }
+}
+
+const CYCLE_BASE = resolveBase()
+
+function requireBase(b = CYCLE_BASE) {
+  if (b.sha) return b.sha
+  throw new Error(
+    `cannot resolve the cycle's diff base — tried ${b.tried.join('; ')}. `
+    + 'A shallow or single-branch checkout has no merge base with the default branch: '
+    + 'set fetch-depth: 0 on the workflow checkout step. Falling back to HEAD is not an '
+    + 'option — it would empty the subject set and make E2.3/E2.4/E3.5 pass vacuously.',
+  )
+}
 
 // The engine modules this cycle ADDS, derived rather than listed: the modules that
 // already existed at BASE are separately asserted byte-identical to BASE (E2.3, E3.5),
 // so a literal inside one of them is not this cycle's subject.
-const baseEngineFiles = new Set(
-  execFileSync('git', ['ls-tree', '--name-only', BASE, 'engine/'], { cwd: root, encoding: 'utf8' })
-    .trim().split('\n').map((p) => p.replace(/^engine\//, '')),
-)
-const newEngineSources = () => engineSources().filter(([f]) => !baseEngineFiles.has(f))
+const _baseEngineFiles = new Map()
+function baseEngineFiles(b = CYCLE_BASE) {
+  const sha = requireBase(b)
+  if (!_baseEngineFiles.has(sha)) {
+    _baseEngineFiles.set(sha, new Set(
+      gitTry(['ls-tree', '--name-only', sha, 'engine/']).split('\n')
+        .filter((l) => l !== '').map((l) => l.replace(/^engine\//, '')),
+    ))
+  }
+  return _baseEngineFiles.get(sha)
+}
+const newEngineSources = (b = CYCLE_BASE) => engineSources().filter(([f]) => !baseEngineFiles(b).has(f))
 
 // Read a subject module with a failure message that names the missing subject
 // rather than surfacing a raw ENOENT.
@@ -617,7 +673,7 @@ await test('E3.4/AC3: gate thresholds are injected, not hard-coded in the engine
 })
 
 await test('E3.5/AC3: engine/gate.mjs is reused unmodified — byte-identical to the cycle base', () => {
-  assert.equal(readRepo('engine/gate.mjs'), gitShow(`${BASE}:engine/gate.mjs`),
+  assert.equal(readRepo('engine/gate.mjs'), gitShow(`${requireBase()}:engine/gate.mjs`),
     'AC3 says reuse; any edit here means the calculator was reimplemented rather than reused')
 })
 
@@ -662,8 +718,46 @@ await test('E2.3/AC2: transitions are computed by reading the spec through resol
     'the hop followed a target the engine cannot know except by reading the spec')
 })
 
+await test('E2.3b/AC2: the cycle diff base resolves to a real commit that is a STRICT ancestor of HEAD', () => {
+  const sha = requireBase()
+  assert.match(sha, /^[0-9a-f]{7,40}$/, 'the base must be a commit id, not a ref name that a later command re-resolves')
+  assert.equal(gitTry(['cat-file', '-t', sha]), 'commit', 'the resolved base must be a real commit object')
+  assert.doesNotThrow(() => gitTry(['merge-base', '--is-ancestor', sha, 'HEAD']),
+    'a base that is not an ancestor of HEAD cannot describe what this cycle changed')
+  assert.notEqual(sha, gitTry(['rev-parse', 'HEAD']),
+    'the base must not be HEAD itself — that is exactly the vacating this constant exists to prevent')
+  assert.ok(newEngineSources().length > 0,
+    'the base yields an empty subject set, so the cap-literal scan and both reuse byte-compares are vacuous')
+  assert.ok(BASE_CANDIDATES.includes(CYCLE_BASE.ref))
+})
+
+await test('E2.3b/AC2: an unresolvable base RAISES with an actionable message — it never degrades to an empty subject set', () => {
+  // The CI-shallow shape: no candidate resolves. Reproduced by resolving against a
+  // ref that cannot exist, so the case does not depend on the checkout it runs in.
+  const none = resolveBase(['refs/heads/no-such-ref-for-this-case'])
+  assert.equal(none.sha, null)
+  assert.equal(none.tried.length, 1, 'every attempted candidate must be recorded for the operator')
+  assert.match(none.tried[0], /no-such-ref-for-this-case/, 'the message must name what it tried')
+
+  assert.throws(() => requireBase(none), /cannot resolve the cycle's diff base/)
+  assert.throws(() => requireBase(none), /fetch-depth: 0/, 'the message must name the fix, not just the symptom')
+
+  // The load-bearing half: the subject-set path must propagate the failure rather
+  // than returning [], which would turn E2.4's scan into a vacuous pass.
+  assert.throws(() => baseEngineFiles(none), /cannot resolve the cycle's diff base/)
+  assert.throws(() => newEngineSources(none), /cannot resolve the cycle's diff base/)
+
+  // Every candidate is tried before giving up, so a checkout that has only one of
+  // them still resolves. Conditioned on this checkout having a base at all, so the
+  // guard above stays assertable in the very checkout it exists to diagnose.
+  if (CYCLE_BASE.sha) {
+    const partial = resolveBase(['refs/heads/no-such-ref-for-this-case', ...BASE_CANDIDATES])
+    assert.equal(partial.sha, CYCLE_BASE.sha, 'a leading unresolvable candidate must not abort the search')
+  }
+})
+
 await test('E2.3/AC2 structural: engine/routing.mjs is byte-identical to the cycle base (reused, not reimplemented)', () => {
-  assert.equal(readRepo('engine/routing.mjs'), gitShow(`${BASE}:engine/routing.mjs`),
+  assert.equal(readRepo('engine/routing.mjs'), gitShow(`${requireBase()}:engine/routing.mjs`),
     'exhaustionTarget() belongs in engine/flow.mjs precisely so this check stands unweakened')
 })
 
