@@ -256,7 +256,16 @@ function delegationOutputFor(sp, stepId, wanted, opts = {}) {
     return { max_severity: opts.maxSeverity || 'Medium', findings: [], low_confidence_items: [] }
   }
   if (stepOf(sp, stepId).kind === 'gate') {
-    return { scores: opts.scores || (wanted === 'pass' ? PASSING_SCORES : FAILING_SCORES) }
+    const scores = opts.scores || (wanted === 'pass' ? PASSING_SCORES : FAILING_SCORES)
+    // `spec/roles/evaluator.yaml` declares must_contain: [scores] — a MINIMUM, not an
+    // exclusive list — so a real evaluator plausibly emits a verdict alongside its
+    // scores. The double therefore always self-reports the OPPOSITE of what the scores
+    // compute (invariant 3, spec/roles/evaluator.yaml:9-11: "the verdict is not this
+    // role's to declare"). Every gate-driving case below is consequently a live
+    // invariant-3 discriminator: an engine that reads `pass` or `verdict` routes every
+    // one of them backwards.
+    const computed = GATE.computeVerdict(scores)
+    return { scores, pass: !computed.pass, verdict: computed.pass ? 'FAIL' : 'PASS' }
   }
   return { outcome: wanted }
 }
@@ -345,6 +354,33 @@ function edgePlan(sp, step, outcome) {
   if (rows.length === 0) return { seed: undefined, feed: outcome } // CAP_LOOPS-owned → agent-reported (E2.5b)
   const capKey = RT.CAP_EDGES[rows[0]].capKey
   return { seed: { [capKey]: RT.capValue(sp, capKey) }, feed: rows[0].split(':')[1] }
+}
+
+// The effect fields each mechanical handler's declared `done-when` CONJOINS
+// (feature design §2.3 / §6). `done-when` is stored as an opaque folded string and
+// nothing parses it (engine/spec-load.mjs, C10), so the field names are a design
+// statement rather than a spec derivation — the PROSE_SOURCED shape. What is derived
+// is that every listed conjunct is independently load-bearing: no count is authored,
+// the cases iterate the table.
+const DONE_WHEN = {
+  preflight: { outcome: 'ready', conjuncts: ['treeClean', 'remoteSynced', 'branchCreated'] },
+  dispatch: { outcome: 'assigned', conjuncts: ['assigned'] },
+  validate: { outcome: 'done', conjuncts: ['testsPass', 'scenariosItemized', 'docsUpdated', 'artifactsCoherent'] },
+  deliver: { outcome: 'pushed', conjuncts: ['pushed'] },
+}
+
+// One advance() over one mechanical step with a caller-supplied effect record, so a
+// case can present a PARTIALLY satisfied done-when. The EFFECT_FOR oracle derives
+// every field from a single wanted outcome, which moves the fields together and can
+// therefore never witness one conjunct at a time.
+function advanceMechanical(sp, stepId, record, extra = {}) {
+  return FLOW.advance(sp, FLOW.initialState(sp, { issue: '#4', start: stepId }), {
+    effects: { [stepId]: () => record },
+    artifacts: artifactsMap(sp),
+    persist: () => {},
+    statePath: SCRATCH_STATE,
+    ...extra,
+  })
 }
 
 // A gate step's outcome domain under advance() is exactly {pass, fail} — invariant 3
@@ -510,9 +546,17 @@ await test('E3.1/AC3: score sets straddling each threshold route on the calculat
 await test('E3.2/AC3: invariant 3 — the engine never reads the evaluator\'s self-reported pass claim', () => {
   const sp = spec()
   const nx = stepOf(sp, 'gate_plan').next
-  const a = runFlow(sp, { start: 'gate_plan', outcomes: oneShot('gate_plan', 'x'), scores: FAILING_SCORES,
-    // the delegation ALSO self-reports a pass; the engine must ignore it
-  })
+  // Precondition, asserted rather than assumed: the double really does self-report a
+  // verdict, and really does contradict its own scores. Without this the case silently
+  // degrades into a duplicate of E3.1 — which is exactly what it had done.
+  const failing = delegationOutputFor(sp, 'gate_plan', 'x', { scores: FAILING_SCORES })
+  assert.equal(failing.pass, true, 'the double must self-report a PASS while its scores fail')
+  assert.equal(failing.verdict, 'PASS')
+  const passing = delegationOutputFor(sp, 'gate_plan', 'x', { scores: PASSING_SCORES })
+  assert.equal(passing.pass, false, 'the double must self-report a FAIL while its scores pass')
+  assert.equal(passing.verdict, 'FAIL')
+
+  const a = runFlow(sp, { start: 'gate_plan', outcomes: oneShot('gate_plan', 'x'), scores: FAILING_SCORES })
   assert.equal(a.trace[0].outcome, 'fail')
   assert.equal(a.trace[0].to, mget(nx, 'fail'), 'a self-reported {pass:true} must not route to the pass target')
 
@@ -930,6 +974,74 @@ await test('E1.3b/AC1: effort and provider come from the binding — effort is n
   }
 })
 
+await test('E1.3c/AC1: expectedOutcomes is the step\'s declared outcome set — the boundary tells the adapter what it may return', () => {
+  const sp = spec()
+  for (const id of delegatedIds(sp)) {
+    const req = requestFor(sp, id).event.request
+    assert.deepEqual(req.expectedOutcomes, mkeys(stepOf(sp, id).next),
+      `${id}: an empty or partial list lets the adapter return an outcome resolve() will only reject later`)
+  }
+})
+
+await test('E1.3c/AC1: criteria crosses the boundary exactly where the step declares it (invariant 10)', () => {
+  const sp = spec()
+  const declaring = delegatedIds(sp).filter((id) => stepOf(sp, id).criteria !== undefined)
+  assert.ok(declaring.length > 0, 'derived witness set must not be empty')
+  for (const id of delegatedIds(sp)) {
+    const req = requestFor(sp, id).event.request
+    const declared = stepOf(sp, id).criteria
+    if (declared === undefined) {
+      assert.ok(!('criteria' in req), `${id} declares no criteria, so the request must not invent one`)
+    } else {
+      assert.equal(req.criteria, declared, `${id}: the criteria name must reach the evaluator`)
+    }
+  }
+})
+
+await test('E1.3c/AC1 (invariant 7): isolated crosses the boundary exactly where the loop declares it', () => {
+  const sp = spec()
+  const isolating = delegatedIds(sp).filter((id) => stepOf(sp, id).loop && stepOf(sp, id).loop.isolated !== undefined)
+  assert.ok(isolating.length > 0, 'derived witness set must not be empty — invariant 7 has no carrier otherwise')
+  for (const id of delegatedIds(sp)) {
+    const st = stepOf(sp, id)
+    const req = requestFor(sp, id).event.request
+    const declared = st.loop ? st.loop.isolated : undefined
+    if (declared === undefined) {
+      assert.ok(!('isolated' in req), `${id} declares no isolation, so the request must not assert one`)
+    } else {
+      assert.equal(req.isolated, declared,
+        `${id}: invariant 7 is carried by this field — dropping it silently lets round-by-round cross-talk escape`)
+    }
+  }
+})
+
+await test('E1.3c/AC1 (invariant 2): session crosses the boundary exactly where the ROLE declares it', () => {
+  const sp = spec()
+  const declaring = rolePairs(sp).filter(([, r]) => mget(sp.roles, r).session !== undefined)
+  assert.ok(declaring.length > 0, 'derived witness set must not be empty — invariant 2 has no carrier otherwise')
+  for (const [id, role] of rolePairs(sp)) {
+    if (isMechanical(sp, id)) continue
+    const frame = requestFor(sp, id).event.request.perRole[role]
+    const declared = mget(sp.roles, role).session
+    if (declared === undefined) {
+      assert.ok(!('session' in frame), `${id}:${role} — the role declares no session, so the frame must not invent one`)
+    } else {
+      assert.equal(frame.session, declared,
+        `${id}:${role} — "fresh" is invariant 2; dropping it lets the adapter reuse a session with prior history`)
+    }
+  }
+})
+
+await test('E1.2b/AC1: the persisted pending marker carries the roles the request was built for', () => {
+  const sp = spec()
+  for (const id of delegatedIds(sp)) {
+    const r = requestFor(sp, id)
+    assert.deepEqual(r.state.pending.roles, r.event.request.roles,
+      `${id}: a resumed run reads pending, so a pending marker without roles cannot say who is outstanding`)
+    assert.deepEqual(r.state.pending.request, r.event.request)
+  }
+})
+
 await test('E1.4(a)/AC1 (invariants 1+4): every frame\'s input keys are a SUBSET of that role\'s declared input', () => {
   const sp = spec()
   for (const [id, role] of rolePairs(sp)) {
@@ -1002,6 +1114,33 @@ await test('E1.4(c2)/AC1 non-case: a loop-carry row at a loop-less step resolves
   }
 })
 
+await test('E1.4(c3)/AC1: a step delegating to an UNDECLARED role is refused, never given an empty frame', () => {
+  const sp = cloneSpec(spec())
+  assert.ok(!mhas(sp.roles, 'ghost-role'), 'precondition: the role really is undeclared')
+  stepOf(sp, 'red').agents = [...stepOf(sp, 'red').agents, 'ghost-role']
+  let thrown = null
+  assert.throws(() => { requestFor(sp, 'red') }, (e) => { thrown = e; return true })
+  assert.equal(thrown.code, 'slot-unsourced',
+    'a role the declaration does not define has no input vocabulary — building a frame for it would breach invariant 1')
+  assert.equal(thrown.role, 'ghost-role')
+})
+
+await test('E1.4(c4)/AC1: a criteria slot with no declared criteria is refused, never filled with undefined', () => {
+  const sp = cloneSpec(spec())
+  const gate = 'gate_plan'
+  assert.notEqual(stepOf(spec(), gate).criteria, undefined, 'precondition: the live step declares criteria')
+  assert.ok(mget(sp.roles, 'evaluator').input.includes('criteria'), 'precondition: the role declares the slot')
+  delete stepOf(sp, gate).criteria
+  let thrown = null
+  assert.throws(() => { requestFor(sp, gate) }, (e) => { thrown = e; return true })
+  assert.equal(thrown.code, 'missing-slot',
+    'an evaluator scored against an undefined criteria set is the fail-open case invariant 10 exists to prevent')
+  assert.deepEqual(
+    { step: thrown.step, role: thrown.role, slot: thrown.slot, source: thrown.source },
+    { step: gate, role: 'evaluator', slot: 'criteria', source: 'criteria' },
+  )
+})
+
 await test('E1.4b/AC1: SLOT_SOURCES is total over the spec-derived triple set', () => {
   assert.deepEqual(Object.keys(FLOW.SLOT_SOURCES).sort(), slotTriples(spec()),
     'the row key set is the derivation, never an authored cardinality')
@@ -1049,6 +1188,51 @@ await test('E1.5/AC1: a mechanical step with an EMPTY agents list never returns 
     assert.equal(r.events[0].kind, 'transition', `${id} opened a session instead of executing in engine code`)
     assert.equal(r.requests.length, 0)
   }
+})
+
+for (const [step, { outcome, conjuncts }] of Object.entries(DONE_WHEN)) {
+  await test(`E1.5b/AC1 (invariant 5): ${step} — EVERY done-when conjunct is independently load-bearing`, () => {
+    const sp = spec()
+    const satisfied = EFFECT_FOR[step](outcome)
+    for (const field of conjuncts) {
+      assert.ok(field in satisfied, `the satisfying record does not carry "${field}" — the table and the fixture disagree`)
+    }
+    const ok = advanceMechanical(sp, step, satisfied)
+    assert.equal(ok.event.kind, 'transition', `${step}: the fully satisfied record must reach its declared outcome`)
+    assert.equal(ok.event.outcome, outcome)
+
+    for (const field of conjuncts) {
+      const partial = { ...satisfied, [field]: false }
+      const r = advanceMechanical(sp, step, partial)
+      assert.equal(r.event.kind, 'halt',
+        `${step}: with "${field}" unmet the handler still reached an outcome — a transition fired on an undeclared completion condition`)
+      assert.equal(r.event.step, step)
+      assert.equal(r.state.step, step, `${step}: the step must not advance`)
+      assert.deepEqual(r.state.history, [], `${step}: no history entry for an unmet done-when`)
+    }
+  })
+}
+
+await test('E1.5b/AC1: integrate — the declared no-op (no integration layer registered) is a PASS, not a skip', () => {
+  const sp = spec()
+  const nx = stepOf(sp, 'integrate').next
+  // spec/steps/integrate.yaml's done-when is a disjunction: the suite passes, OR the
+  // project registers no integration layer. The second arm has to be witnessed on its
+  // own, with `pass` absent — otherwise the arm can be deleted with the suite green.
+  const noop = advanceMechanical(sp, 'integrate', { registered: false })
+  assert.equal(noop.event.kind, 'transition', 'the no-op arm must reach a declared outcome')
+  assert.equal(noop.event.outcome, 'pass')
+  assert.equal(noop.event.to, mget(nx, 'pass'))
+
+  const passing = advanceMechanical(sp, 'integrate', { registered: true, pass: true })
+  assert.equal(passing.event.outcome, 'pass')
+  const failing = advanceMechanical(sp, 'integrate', { registered: true, pass: false })
+  assert.equal(failing.event.outcome, 'fail')
+  assert.equal(failing.event.to, mget(nx, 'fail'))
+
+  // Registered but with no verdict reported satisfies neither arm.
+  const silent = advanceMechanical(sp, 'integrate', { registered: true })
+  assert.equal(silent.event.kind, 'halt', 'a registered layer that reported nothing must not be read as a pass')
 })
 
 await test('E1.5/AC1: NO_EFFECTS refuses rather than silently succeeding — M1 ships no real side-effect layer', () => {
@@ -1229,6 +1413,29 @@ await test('E4.5/AC4: crash-safety — a truncated, a version-skewed and an unkn
     'the closed key set is what lets E4.2 be a deep-equal round-trip')
 })
 
+await test('E4.5/AC4: a well-formed JSON document that is not a state OBJECT is rejected typed', () => {
+  const dir = tmpRoot()
+  // JSON.parse succeeds on each of these, so a loader that goes straight to
+  // `doc.version` raises a bare TypeError (or, for an array, mis-reports a version
+  // skew) instead of the typed state-corrupt the resume path is guaranteed to give.
+  for (const [name, body] of [['null', 'null'], ['array', '[]'], ['string', '"preflight"'], ['number', '42']]) {
+    const p = join(dir, `not-an-object-${name}.json`)
+    writeFileSync(p, body)
+    let thrown = null
+    assert.throws(() => { RS.loadState(p) }, (e) => { thrown = e; return true }, `${name} was accepted`)
+    assert.equal(thrown.code, 'state-corrupt', `a ${name} document must be rejected as corrupt, not coerced or mis-typed`)
+  }
+})
+
+await test('E4.5/AC4: an unreadable or absent state file is rejected typed, not as a raw fs error', () => {
+  const dir = tmpRoot()
+  let thrown = null
+  assert.throws(() => { RS.loadState(join(dir, 'never-written.json')) }, (e) => { thrown = e; return true })
+  assert.equal(thrown.code, 'state-corrupt',
+    'a caller distinguishing "no cycle in flight" from "the state is broken" reads the typed code, not an errno')
+  assert.equal(thrown.name, 'StateCorruptError')
+})
+
 await test('E4.5/AC4: the write is atomic (tmp + rename) and leaves no partial document behind', () => {
   const dir = tmpRoot()
   const path = join(dir, 'run-4.json')
@@ -1357,6 +1564,40 @@ await test('E5.3(c)/AC5: engine/cli.mjs spawned as a child exits 2 on escalate a
   assert.equal(end.status, 0)
 })
 
+await test('E5.3(e)/AC5: the CLI keeps DRIVING after a transition — it does not stop at the first hop', () => {
+  const sp = spec()
+  const dir = tmpRoot()
+  const path = join(dir, 'run-4-driving.json')
+  // A state pending on a gate step. The CLI supplies no delegation output, so
+  // computeVerdict() sees no scores and fails closed — one real transition, to
+  // gate_plan's declared `fail` target. The CLI carries NO_EFFECTS and an empty
+  // artifacts map, so the SUCCESSOR step cannot be served: a CLI that keeps driving
+  // reaches it and the engine refuses there (the CLI has no error boundary, by
+  // design — feature design §3 makes it a ≤15-line entry), while a CLI that breaks
+  // after the first hop instead reports an orderly escalate. The successor's typed
+  // refusal on stderr is therefore the witness that the loop iterated.
+  const successor = mget(stepOf(sp, 'gate_plan').next, 'fail')
+  writeFileSync(path, JSON.stringify({
+    version: RS.STATE_VERSION, issue: '#4', step: 'gate_plan', counters: {}, history: [],
+    pending: { step: 'gate_plan', roles: ['evaluator'], request: { step: 'gate_plan', roles: ['evaluator'] } },
+    status: 'delegating', terminal: null, halt: null,
+  }))
+  const res = runCli(path)
+  assert.notEqual(res.status, ESC.EXIT_CODES.escalate,
+    'the CLI reported an orderly escalate after one hop — its drive loop never iterated')
+  assert.match(res.stderr, /missing-slot|MissingSlotError/,
+    `the CLI must have reached ${successor} and been refused there`)
+
+  // The hop it did make is on record, so "it kept driving" is not confused with
+  // "it never started".
+  const after = JSON.parse(readFileSync(path, 'utf8'))
+  assert.equal(after.history.length, 1, 'the first transition must have been persisted')
+  assert.deepEqual(
+    { from: after.history[0].from, outcome: after.history[0].outcome, to: after.history[0].to },
+    { from: 'gate_plan', outcome: 'fail', to: successor },
+  )
+})
+
 await test('E5.3(d)/AC5: the CLI actually RAN persist and notify — not merely a hard-coded exit code', () => {
   const dir = tmpRoot()
   const path = seedTerminalState(dir, 'escalate')
@@ -1382,9 +1623,53 @@ await test('E5.4/AC5: notify receives a JSON-serializable RECORD, not a formatte
   let rec = null
   ESC.escalate(r.state, { statePath: SCRATCH_STATE, persist: () => {}, notify: (x) => { rec = x } })
   assert.equal(typeof rec, 'object', 'a formatted string would make the transport non-substitutable')
-  assert.deepEqual(Object.keys(rec).sort().filter((k) => k !== 'capKey'),
-    ['issue', 'reason', 'statePath', 'step', 'terminal'])
+  assert.deepEqual(Object.keys(rec).sort(),
+    ['capKey', 'issue', 'reason', 'statePath', 'step', 'terminal'],
+    'the key set is closed — capKey included, because it is the field that says WHICH budget ran out')
   assert.equal(JSON.parse(JSON.stringify(rec)).terminal, 'escalate')
+  assert.equal(rec.step, r.state.step)
+  assert.equal(rec.capKey, null, 'this escalate consumed no budget, so no cap may be blamed for it')
+  assert.match(rec.reason, /escalate/, 'the operator-facing reason must name where the run stopped')
+})
+
+await test('E5.4/AC5: the notify record names the exhausted budget on a cap-exhaustion escalate', () => {
+  const sp = spec()
+  // Derived: every engine-counted cap key whose exhaustion lands on `escalate`. The
+  // record's `capKey` is what tells an operator which budget ran out; a constant null
+  // makes every exhaustion look alike.
+  const keys = engineCapKeys().filter((k) => expectedExhaustion(sp, k).target === 'escalate')
+  assert.ok(keys.length > 0, 'derived witness set must not be empty')
+  for (const capKey of keys) {
+    const [step, outcome] = edgeRowsFor(capKey)[0].split(':')
+    const r = runFlow(sp, { start: step, outcomes: oneShot(step, outcome), seedCounters: { [capKey]: RT.capValue(sp, capKey) } })
+    assert.equal(r.state.step, 'escalate', `${capKey}: precondition — the exhaustion reaches escalate`)
+    let rec = null
+    ESC.escalate(r.state, { statePath: SCRATCH_STATE, persist: () => {}, notify: (x) => { rec = x } })
+    assert.equal(rec.capKey, capKey, `${capKey}: the record must name the budget that ran out`)
+    assert.equal(rec.terminal, 'escalate')
+  }
+})
+
+await test('E5.4/AC5: the notify record carries the halt\'s own reason and step, not a fixed string', () => {
+  const sp = spec()
+  // Two structurally different halts must produce two different reasons, so the field
+  // cannot be a constant and cannot be derived from the terminal alone.
+  const seen = new Set()
+  const halts = [
+    ['validate', oneShot('validate', 'incomplete'), undefined],
+    ['handoff', oneShot('handoff', 'review-findings'), 'Low'],
+  ]
+  for (const [step, outcomes, maxSeverity] of halts) {
+    const r = runFlow(sp, { start: step, outcomes, maxSeverity })
+    assert.equal(r.event.kind, 'halt', `${step}: precondition — the scenario halts`)
+    let rec = null
+    ESC.escalate(r.state, { statePath: SCRATCH_STATE, persist: () => {}, notify: (x) => { rec = x } })
+    assert.equal(rec.reason, r.state.halt.reason, `${step}: the record must carry the halt's own reason`)
+    assert.equal(rec.step, r.state.halt.step, `${step}: the record must name the step that halted`)
+    assert.ok(rec.reason.includes(step), `${step}: the reason must identify where the run stopped`)
+    seen.add(rec.reason)
+  }
+  assert.equal(seen.size, halts.length, 'two different halts produced the same reason — the field is a constant')
 })
 
 await test('E5.4b/AC5: handoff\'s undeclared outcome halts rather than inventing an edge', () => {
