@@ -3729,10 +3729,41 @@ function cycleDigestPath() {
 // The sources setup/manifest.json registers. The derived-artifact rule is a
 // MECHANICAL set-intersection, not a judgment call: the regenerated manifest is
 // admitted into a cycle's surface exactly when the cycle touched one of these.
-function manifestSources() {
-  const rel = 'setup/manifest.json'
+const MANIFEST_REL = 'setup/manifest.json'
+
+// The sources setup/manifest.json registers, UNIONED across the delta's two ends.
+// Reading only the HEAD manifest would miss an artifact that was REMOVED: its source
+// file is in the delta (as a deletion) while the post-change manifest no longer names
+// it, so the trigger would look absent although the manifest legitimately changed.
+// The union is a derivation, not an exception.
+function manifestSourcesAt(text) {
+  try { return (JSON.parse(text).artifacts || []).map((a) => a.source) } catch { return null }
+}
+function manifestSources(base = null) {
+  if (!existsSync(join(root, MANIFEST_REL))) return null
+  const head = manifestSourcesAt(readRepo(MANIFEST_REL))
+  if (head === null) return null
+  if (!base) return head
+  let atBase = []
+  try { atBase = manifestSourcesAt(gitShow(`${base}:${MANIFEST_REL}`)) || [] } catch { atBase = [] }
+  return [...new Set([...head, ...atBase])]
+}
+
+// The manifest's own PRODUCERS — the two files that change the manifest without being
+// hashed INTO it, and therefore the one legitimate way it can move with no registered
+// source in the delta. Both are DERIVED from the generator's own assignments rather
+// than listed, so a rename moves them with the script:
+//   - the generator itself, whose artifact list and hash algorithm decide the output.
+//     Measured: it is NOT a registered source, so it cannot trigger the rule any other way.
+//   - the version-stamp source it reads (`PLUGIN_JSON`), which supplies
+//     `manifest.version`. Measured: likewise not a registered source.
+// This is the ONE stated exception, admitted as a narrow row with its reason — the
+// same shape as the digest row — never as a general "manifest changes are fine".
+function manifestProducers() {
+  const rel = 'setup/gen-manifest-hashes.sh'
   if (!existsSync(join(root, rel))) return null
-  try { return (JSON.parse(readRepo(rel)).artifacts || []).map((a) => a.source) } catch { return null }
+  const m = /^PLUGIN_JSON="([^"\n]+)"\s*$/m.exec(readRepo(rel))
+  return m ? [rel, m[1]] : null
 }
 
 await test('E4.45/AC-C4-6: the branch\'s own delta obeys the DURABLE surface rules — the digest is append-only, and the manifest rides its trigger', () => {
@@ -3774,15 +3805,52 @@ await test('E4.45/AC-C4-6: the branch\'s own delta obeys the DURABLE surface rul
   // not a judgment call: if the delta touches a manifest-registered source, the
   // regenerated manifest belongs in the same change. Evaluated here rather than
   // assumed, so the manifest is neither demanded without cause nor forgotten with it.
-  const MANIFEST = 'setup/manifest.json'
-  const sources = manifestSources()
-  assert.ok(Array.isArray(sources), `${MANIFEST} is unreadable, so the derived-artifact condition cannot be evaluated`)
-  const touched = files.filter((f) => f !== MANIFEST && sources.includes(f))
-  if (touched.length > 0) {
-    assert.ok(files.includes(MANIFEST),
-      `this delta touches manifest-registered source(s) ${touched.join(', ')} but does not carry the regenerated `
-      + `${MANIFEST}; run setup/gen-manifest-hashes.sh and stage it in the same commit`)
+  const MANIFEST = MANIFEST_REL
+  const sources = manifestSources(base)
+  const producers = manifestProducers()
+  assert.ok(Array.isArray(sources) && sources.length > 0,
+    `${MANIFEST} is unreadable at HEAD, so the derived-artifact condition cannot be evaluated`)
+  assert.ok(Array.isArray(producers) && producers.length === 2,
+    'the manifest generator no longer declares its version-stamp source where this case can derive it — re-derive '
+    + 'the producer set from setup/gen-manifest-hashes.sh before trusting this rule')
+  const touchedSources = files.filter((f) => f !== MANIFEST && sources.includes(f))
+  const touchedProducers = files.filter((f) => producers.includes(f))
+  const inDelta = files.includes(MANIFEST)
+
+  // The rule is a BICONDITIONAL — the manifest is in the delta iff a trigger is —
+  // and the two directions take DIFFERENT trigger sets, because the two kinds of
+  // trigger do not mean the same thing. Measured, not assumed:
+  //
+  //   a REGISTERED SOURCE's hash is IN the manifest, so touching one NECESSARILY
+  //     moves the manifest. It both demands and justifies the regen.
+  //   a PRODUCER decides how the manifest is BUILT and is hashed into nothing, so
+  //     touching one MAY leave the output byte-identical — a comment added to the
+  //     generator does exactly that, verified. It justifies a regen; it cannot demand
+  //     one, and a forward assertion over producers reds on a legitimate commit.
+  //
+  // Hence: forward over sources, converse over sources ∪ producers.
+  if (touchedSources.length > 0) {
+    assert.ok(inDelta,
+      `this delta touches manifest-registered source(s) ${touchedSources.join(', ')} but does not carry the `
+      + `regenerated ${MANIFEST}; run setup/gen-manifest-hashes.sh and stage it in the same commit`)
   }
+  // The direction the PR #10 reviewer found missing. The one-way form caught a source
+  // changed without its regen and let a manifest changed with NO trigger through — a
+  // tampered sha256, or a stale regen committed for no reason, rode along unexamined.
+  // Cycle 4's allowed-set formulation caught that as a side effect; generalizing
+  // dropped it, so it is restored as an explicit assertion rather than a side effect.
+  if (inDelta) {
+    assert.ok(touchedSources.length + touchedProducers.length > 0,
+      `${MANIFEST} changed but this delta touches none of its triggers — no registered source, and neither `
+      + `producer (${producers.join(', ')}). A manifest that moves on its own is a hand edit or a stale regen, `
+      + 'and the derived-artifact rule authorises neither')
+  }
+  // DECLARED LIMIT, stated rather than left to be found: a producer change that DOES
+  // alter the output and is not regenerated passes here, because deciding it requires
+  // running the generator (it shells out to jq/shasum) and this suite is offline and
+  // stdlib-only. The strongest part of that residual is already covered elsewhere —
+  // the generator's own header records that verify-install-into-target AC2e asserts
+  // every copy row's sha256 equals the current source hash.
 })
 
 await test('E4.47/AC-C4-1,2 (cycle 4): the predicate\'s far edge — a `scores` that is PRESENT but is not a score table', () => {
