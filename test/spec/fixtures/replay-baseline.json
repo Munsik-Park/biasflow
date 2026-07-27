@@ -1,0 +1,44 @@
+[
+  {
+    "code": "cap-exceeded",
+    "severity": "error",
+    "where": "#13",
+    "metric": "architect.rounds",
+    "actual": 10,
+    "expected": 6,
+    "provenance": "derived-by-grep",
+    "escalate": false,
+    "message": "#13: recorded architect.rounds 10 exceeds the declared cap 6"
+  },
+  {
+    "code": "cap-exceeded",
+    "severity": "error",
+    "where": "#25",
+    "metric": "architect.rounds",
+    "actual": 67,
+    "expected": 6,
+    "provenance": "derived-by-grep",
+    "escalate": false,
+    "message": "#25: recorded architect.rounds 67 exceeds the declared cap 6"
+  },
+  {
+    "code": "cap-exceeded",
+    "severity": "error",
+    "where": "#30",
+    "metric": "regressions.review_autofix_cycles",
+    "actual": 9,
+    "expected": 7,
+    "provenance": "derived-by-grep",
+    "escalate": false,
+    "message": "#30: recorded regressions.review_autofix_cycles 9 exceeds the declared cap 7"
+  },
+  {
+    "code": "avg-rounding-policy-divergence",
+    "severity": "warn",
+    "where": "corpus",
+    "metric": "gates.*.avg",
+    "actual": "unrounded add/length (scripts/handoff/emit-cycle-digest.sh:158)",
+    "expected": "add/length*10 | round /10 (.claude/hooks/check-autoflow-gate.sh:476)",
+    "message": "the digest emitter and the gate calculator use different rounding policies for the gate average; the replay compares at 1 dp on both sides"
+  }
+]

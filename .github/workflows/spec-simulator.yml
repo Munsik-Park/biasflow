@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 Munsik-Park
+# SPDX-License-Identifier: Elastic-2.0
+# .github/workflows/spec-simulator.yml — spec simulator regression (issue #2)
+#
+# Runs the declaration lint (AC1), the synthetic-flow simulation (AC2), the cycle
+# digest replay (AC3) and this workflow's own wiring assertions (AC4) via
+# test/spec/run.mjs against the engine modules under engine/**.
+#
+# The suite reads only host-repo files (spec/**, engine/**, test/spec/**,
+# docs/cycle-digest.jsonl, .claude/hooks/check-autoflow-gate.sh) and uses solely
+# node: builtins, so no dependency installation step is needed. The gate hook is in
+# the trigger set because engine/gate.mjs takes it as its behavioral source: a hook
+# edit must re-run the differential equivalence cases or the equivalence claim goes
+# stale silently.
+#
+# Enforcement level: ADVISORY, matching workflow-regression.yml — this repo's plan
+# provides no branch protection, so a red run surfaces a signal the external
+# reviewer verifies green before merging rather than auto-blocking the merge.
+
+name: spec-simulator
+
+on:
+  pull_request:
+    paths:
+      - 'spec/**'
+      - 'engine/**'
+      - 'test/spec/**'
+      - 'docs/cycle-digest.jsonl'
+      - '.claude/hooks/check-autoflow-gate.sh'
+      - '.github/workflows/spec-simulator.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'spec/**'
+      - 'engine/**'
+      - 'test/spec/**'
+      - 'docs/cycle-digest.jsonl'
+      - '.claude/hooks/check-autoflow-gate.sh'
+      - '.github/workflows/spec-simulator.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  simulate:
+    name: Spec simulator suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Pin Node runtime
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '20'
+
+      - name: Run spec simulator suite
+        run: node test/spec/run.mjs

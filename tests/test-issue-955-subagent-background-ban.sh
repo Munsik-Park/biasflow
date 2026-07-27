@@ -765,6 +765,25 @@ else
     # cycle-scoped RED suite + its manual scenarios (feature design §3.2).
     "tests/test-issue-26-verify-architect-route.sh"
     "tests/manual/issue-26-manual-scenarios.md"
+    # #2 spec simulator: declarative step-contract engine (spec-load/routing/
+    # gate/lint/replay) + its CI workflow, self-test fixtures, and manual
+    # scenarios (docs/maintained-docs.md / setup/manifest.json already
+    # admitted above; README.md not yet a member of this suite's list).
+    "README.md"
+    ".github/workflows/spec-simulator.yml"
+    # REUSE bulk-annotation coverage for the spec/**.yaml declarations
+    "REUSE.toml"
+    "engine/gate.mjs"
+    "engine/lint.mjs"
+    "engine/replay.mjs"
+    "engine/routing.mjs"
+    "engine/spec-load.mjs"
+    "test/spec/fixtures/self-test-fail.mjs"
+    "test/spec/fixtures/self-test-pass.mjs"
+    "test/spec/fixtures/replay-baseline.json"
+    "test/spec/fixtures/replay-baseline-records.json"
+    "test/spec/manual-scenarios.md"
+    "test/spec/run.mjs"
   )
   disallowed=""
   while IFS= read -r f; do
