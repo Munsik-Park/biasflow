@@ -323,19 +323,121 @@ export function advance(spec, state, env = {}) {
   } else if (step.kind === 'gate') {
     // Invariant 3: the verdict is computed from the raw scores. Nothing the
     // evaluator self-reports about its own verdict is read.
-    const output = env.delegationOutput || {}
-    outcome = computeVerdict(output.scores, env.thresholds || THRESHOLDS).pass ? 'pass' : 'fail'
+    //
+    // The absence rule (INPUT_BOUNDARY, below): an absent delegated result is
+    // REFUSED here, typed, before any write — never coerced to an empty object.
+    // computeVerdict's own answer for an absent score table is "evaluation not
+    // run", which is not a verdict, and the coercion discarded that distinction
+    // to persist a `fail` and spend a retry for an evaluation that never ran.
+    // The required field is declaration-backed: `scores` is what the evaluator
+    // role declares under must_contain, not a name invented in the engine.
+    const scores = requiredDelegated(env.delegationOutput, stepId, step.kind, 'scores')
+    outcome = computeVerdict(scores, env.thresholds || THRESHOLDS).pass ? 'pass' : 'fail'
   } else {
-    // Same embedder-API guard as the gate branch above (env.delegationOutput
-    // || {}): every shipped delegation is re-entered through the CLI/runFlow,
-    // which always supplies an output, but this step kind is reachable the
-    // same way M21 (the gate branch) turned out to be — a hand-crafted state
-    // document, pending on a non-gate step, driven directly. Left in place
-    // rather than deleted so that path degrades to `outcome: undefined`
-    // (routed to StepIncompleteError/refusal) instead of crashing on a read
-    // of `.outcome` off `undefined`.
-    outcome = (env.delegationOutput || {}).outcome
+    // The sibling of the branch above, decided by the SAME rule and refusing
+    // with the same class — step.kind selects WHICH field is required, never
+    // whether one is. Before this, absence degraded to `outcome: undefined` and
+    // crashed one module down in resolve() as a bare Error with no `code`:
+    // inert against the document, but undeclared and untyped, which is the
+    // defect rather than the defence.
+    outcome = requiredDelegated(env.delegationOutput, stepId, step.kind, 'outcome')
   }
 
   return transitionOn(spec, state, env, stepId, outcome)
 }
+
+// ---- the runtime input boundary ------------------------------------------------
+//
+// Placement, and it is load-bearing rather than stylistic: this block ships at the
+// FOOT of the module. The suite resolves a fixed table of `flow.mjs:<line>` anchors
+// into this file, six of which are cited from the test file itself, and an insert
+// above the executor would silently invalidate anchors no in-scope edit can repoint.
+// A declaration below the last anchored line costs nothing and breaks nothing;
+// `advance()` reaches both names at call time, long after module evaluation.
+
+// The refusal a resume raises when the caller supplied no delegated result. Its
+// message deliberately reuses MissingSlotError's tail — it is the same statement
+// about a different input — and `field` tells a caller WHICH half of the delegated
+// result was absent without parsing that message.
+export class DelegationOutputMissingError extends Error {
+  constructor(step, kind, field) {
+    super(`the "${step}" step was resumed without a delegated "${field}", which the caller did not supply`)
+    this.name = 'DelegationOutputMissingError'
+    this.code = 'delegation-output-missing'
+    this.step = step
+    this.kind = kind
+    this.field = field
+  }
+}
+
+// The one mechanism both resume branches share. Absence is NULLISH — the key is
+// missing, or the value is `null` or `undefined`. It is not truthiness: a supplied
+// `0`, `false`, `''`, `[]` or `{}` is a PRESENT value, and whether it is a USEFUL
+// one is the adapter's contract breach, answered by the layers that already own it
+// (computeVerdict for a score table, resolve() for an outcome). Reading a field off
+// a primitive yields `undefined` rather than throwing, so no `typeof` guard is
+// needed for the check to be total.
+function requiredDelegated(output, stepId, kind, field) {
+  const value = output == null ? undefined : output[field]
+  if (value == null) throw new DelegationOutputMissingError(stepId, kind, field)
+  return value
+}
+
+// The engine's runtime input boundary — one row per caller-supplied value READ SITE,
+// with the DISPOSITION the absence rule assigns it. A row is a DECLARATION, not a
+// branch: the code refuses / defaults / branches on its own, and this table is what a
+// test compares the code's actual `env.` reads against, so a coercion added later
+// cannot ship without a row (and a row cannot be added without naming which
+// disposition it takes). `input` is dotted where the read is of a FIELD of a caller
+// value; the totality check compares on the segment before the first dot.
+//
+// THE RULE. At this boundary an absent caller-supplied value may be:
+//   default  — replaced by a declared substitute named in the module;
+//   branch   — tested for and routed on, as a distinct declared state;
+//   opaque   — handed to a port the engine never interprets it for;
+//   refuse   — stopped by a typed error, raised at the read site, BEFORE any write.
+// It may never be COERCED into a value of the same shape as a present one.
+//
+// THE TEST A NEW ROW MUST PASS. Drive advance() twice on the same document, once with
+// the input ABSENT and once with a legitimate CONTROL value, and project each
+// persisted result onto the closed FOUR-ELEMENT consequential set: (i) a `history`
+// append, (ii) a `counters` increment, (iii) a `step` change, (iv) loss of a `pending`
+// record. consequential(doc) = {historyLen, counters, step, pendingStep}. The coercion
+// is ADMISSIBLE iff the absent run falls in exactly ONE of three buckets, and this
+// row's `reason` names WHICH. These are the only bucket names:
+//   b-i    IMMATERIAL — the projection equals the CONTROL's; the value is not
+//          load-bearing on that path.
+//   b-ii   DECLARED INERTIA — the projection equals the INPUT document's, AND the run
+//          stops in a DECLARED way: a declared event (`delegate`, a declared outcome),
+//          OR a typed error (`code` set) belonging to the engine vocabulary, i.e. an
+//          Error class an engine module exports. That typed-stop sub-case is what a
+//          `refuse` row takes; it is a sub-case of b-ii, not a bucket of its own.
+//          The conjunct is engine vocabulary, and DELIBERATELY not "names the missing
+//          input": measured, EffectsNotWiredError names the STEP and MissingSlotError
+//          names the SLOT, so a naming conjunct would refuse two rows the rule admits.
+//          Whether a stop names its input is recorded per row as an observation.
+//   b-iii  PORT-OWNED — available ONLY to a row whose disposition is `opaque` (the
+//          engine hands the value to a port and dereferences it NOWHERE): the
+//          projection of the ENGINE's own persisted document equals the INPUT
+//          document's, and the run stops in a typed error raised INSIDE the port,
+//          outside the engine vocabulary. Because that stop names nothing the engine
+//          owns, such a row MUST state its measured PORT-LEVEL consequence in `reason`
+//          and a case MUST pin it; without both conjuncts the bucket is unavailable
+//          and the row refuses.
+// ANYTHING ELSE is inadmissible and the site REFUSES. In particular a projection equal
+// to the input's that stops in an UNTYPED throw is NOT admissible — that is precisely
+// what `env.delegationOutput` at the delegated resume used to do — and the WHOLE
+// projection is compared, never field-wise.
+// Inertness alone is NOT enough, and a halt is NOT inert: haltOn() writes
+// {status:'halted', pending: null} — element (iv).
+export const INPUT_BOUNDARY = Object.freeze([
+  { input: 'delegationOutput.scores', site: 'advance:gate-resume', disposition: 'refuse', reason: 'DelegationOutputMissingError - lands in NO bucket: measured, the absent run persists a fail transition, spends gate_plan.retry and moves the step, which equals NEITHER the control (pass, step dispatch) NOR the input document. Refused typed at the read site, before any write, so nothing is persisted and no cap is spent for an evaluation that never ran' },
+  { input: 'delegationOutput.outcome', site: 'advance:delegated-resume', disposition: 'refuse', reason: 'DelegationOutputMissingError - the projection equals the INPUT document (0 writes, measured on every delegated non-gate step) and it STILL lands in no bucket: b-ii additionally requires a DECLARED stop - a declared event, or a typed error in the engine vocabulary - and the measured stop was a BARE Error with an undefined code, thrown in resolve() one module below the read. Inertness without a declared stop is the defect, not the defence' },
+  { input: 'delegationOutput', site: 'advance:mechanical-re-entry', disposition: 'branch', reason: 'admissible on EVERY record class the handoff handler ordered checks distinguish (mechanical.mjs:98-106: envFailure, then ciGreen, then present(reviewComments), then rank(ctx.delegated.max_severity), then reviewBlockPresent) - the domain is that derivation, not a count, and it moves with the handler. reviewComments-ABSENT classes take b-i: the projection is byte-identical to the control, because ctx.delegated is dereferenced ONLY at mechanical.mjs:101-102, both inside a present(reviewComments) test. reviewComments-PRESENT classes take b-ii: a declared delegate event, history 0, counters unchanged, pending RETAINED, whatever the control does - and the controls do three different things (transition review-clean; HALT on a missing outcome with pending destroyed; and, on a Medium max_severity, transition review-findings to diagnose spending handoff.review-response). The absence never produces a consequence the control does not. NOT "never reaches a write": an envFailure record reaches transitionOn() and spends handoff.env-retry with the input absent. NOT opaque: unlike artifacts into ctx, this value IS dereferenced by a handler' },
+  { input: 'artifacts', site: 'advance:buildRequest', disposition: 'refuse', reason: 'MissingSlotError per slot at first read via fromArtifacts(), so the coercion to an empty map is terminal - b-ii, typed-stop sub-case: measured, the projection equals the input document (0 writes) and the stop is typed in the engine vocabulary (code missing-slot). Observed and recorded rather than assumed: that message names the SLOT and its declared source, never the env key, which is why the applied conjunct is engine vocabulary and not naming' },
+  { input: 'artifacts', site: 'advance:mechanical-ctx', disposition: 'opaque', reason: 'b-i - handed to ctx.artifacts and dereferenced by no handler, so the projection is identical to the control and absence produces no outcome' },
+  { input: 'effects', site: 'mechanical:effectOf', disposition: 'refuse', reason: 'b-ii, typed-stop sub-case - EffectsNotWiredError (code effects-not-wired), raised inside effectOf before any write; measured, it names the STEP rather than the env key, which is the second row establishing that the applied conjunct is engine vocabulary. NOTE: a WIRED port that RETURNS no record is a different, measured, unfixed defect of the port contract (open item O6), not an absence at this read site' },
+  { input: 'thresholds', site: 'advance:gate-resume', disposition: 'default', reason: 'b-i - THRESHOLDS, declared in engine/gate.mjs and identical for every caller, so absence is not under-specification. NOTE: a PRESENT empty table imposes no floor and passes every gate - a fabricated pass on the VALIDITY axis, recorded as open item O1 and out of scope for an absence rule' },
+  { input: 'persist', site: 'write', disposition: 'default', reason: 'b-i - saveState, declared in the run-state module; measured, the projection is identical to a control that passes saveState explicitly. NOTE: a present non-function stops as a bare untyped Error, non-consequential, recorded and not fixed' },
+  { input: 'statePath', site: 'write', disposition: 'opaque', reason: 'b-iii, port-owned - the ONLY b-iii row. Handed to the port unread (dereferenced nowhere in the engine), the engine own persisted document is unchanged from the input, and the stop is a typed error raised INSIDE the port (TypeError, ERR_INVALID_ARG_TYPE, from node:fs). It reaches b-iii and NOT b-ii because that stop lies outside the engine vocabulary, and NOT b-i because the control transitions where this throws. The MANDATORY b-iii declaration, measured: this row is NOT inert off the four elements - saveState writes a .tmp file before renaming, so an absent path deposits at ./undefined.tmp in the process CWD a COMPLETE state document whose four-element projection is BYTE-IDENTICAL to the control run persisted document, i.e. the transition completes at the wrong path, before renameSync fails. Pinned by E4.53 in a sandboxed CWD; open item O2 against the run-state port, out of AC-C4 scope' },
+])
