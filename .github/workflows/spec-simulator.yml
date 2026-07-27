@@ -4,11 +4,17 @@
 #
 # Runs the declaration lint (AC1), the synthetic-flow simulation (AC2), the cycle
 # digest replay (AC3) and this workflow's own wiring assertions (AC4) via
-# test/spec/run.mjs against the engine modules under engine/**.
+# test/spec/run.mjs against the engine modules under engine/**, plus the M1
+# flow-engine suite (issue #4) via test/engine/run.mjs.
+#
+# Checkout is FULL-DEPTH (fetch-depth: 0) because test/engine/run.mjs derives its
+# subject set from `git merge-base HEAD main` — under the default shallow checkout
+# that call exits 128 ("Not a valid object name main") and the suite aborts at
+# import, leaving the step permanently red (issue #4 GATE:QUALITY finding).
 #
 # The suite reads only host-repo files (spec/**, engine/**, test/spec/**,
-# docs/cycle-digest.jsonl, .claude/hooks/check-autoflow-gate.sh) and uses solely
-# node: builtins, so no dependency installation step is needed. The gate hook is in
+# test/engine/**, docs/cycle-digest.jsonl, .claude/hooks/check-autoflow-gate.sh) and
+# uses solely node: builtins, so no dependency installation step is needed. The gate hook is in
 # the trigger set because engine/gate.mjs takes it as its behavioral source: a hook
 # edit must re-run the differential equivalence cases or the equivalence claim goes
 # stale silently.
@@ -50,6 +56,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # test/engine/run.mjs resolves `git merge-base HEAD main`; the default
+          # shallow checkout has no `main` object and the suite aborts at import.
+          fetch-depth: 0
 
       - name: Pin Node runtime
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
