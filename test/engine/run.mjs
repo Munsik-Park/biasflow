@@ -2284,6 +2284,14 @@ function extractStateReads(sources) {
   return [...found].sort()
 }
 
+// A nested path — one the declaration can only express with a `shape` row or a nested
+// STATE_UNENFORCED row. Extracted so E4.21b's depth precondition and E4.31's
+// attribution of that precondition are the SAME predicate rather than two copies that
+// can drift: an adequacy claim that names a case by id must be able to run that case's
+// own check.
+const isNestedPath = (p) => p.includes('.')
+const declarationExpressesDepth = (paths) => paths.some(isNestedPath)
+
 // One-way (coverage) on purpose: the converse — every declared path is read — would
 // forbid the retained pass-through rows, which exist precisely because nothing reads
 // them. The declarations supply the COVERING set and the engine source the COVERED
@@ -2363,8 +2371,7 @@ await test('E4.21b/AC-C3-2 (cycle 3): totality at the declared DEPTH — one ina
   // The contract's depth is a property of the DECLARATION, not of a branch bolted on
   // beside it (AC-C3 points 1-2). Authored expectation, not a reading of the table's
   // correctness: if the depth lives anywhere else, a row cannot be what adds it.
-  const nested = paths.filter((p) => p.includes('.'))
-  assert.ok(nested.length > 0,
+  assert.ok(declarationExpressesDepth(paths),
     'the declaration expresses no depth at all — every nested constraint therefore lives in a branch, '
     + `which is what AC-C3 point 2 forbids (declared: [${paths.join(', ')}])`)
 
@@ -2692,9 +2699,23 @@ await test('E4.31/AC-C3-2 (cycle 3): the declaration-level mutation battery — 
   assert.deepEqual(uncoveredReads(reads, declared, open), [],
     'precondition: the unmutated declaration must cover the engine\'s directly-dereferenced read set')
 
+  const nestedReads = reads.filter(isNestedPath)
+  assert.ok(nestedReads.length > 0, 'precondition: the engine must dereference at least one nested path for a depth mutation to mean anything')
+
   const kills = [
     ['emptying STATE_UNENFORCED', () => uncoveredReads(reads, declared, [])],
-    ['dropping every nested `shape` row', () => uncoveredReads(reads, declared.filter((p) => !p.includes('.')), open)],
+    // Restated (cycle 3, VERIFY re-entry). The round-1 form mutated the ENFORCED half
+    // alone — `declared.filter(p => !p.includes('.'))` with `open` untouched — and was
+    // unsatisfiable against a correct declaration, measured: `pending.step` carries an
+    // R3 row in STATE_UNENFORCED precisely because a well-typed `pending.step: 'x'`
+    // stays ACCEPTED and faults typed, and `halt.{reason,step,detail}` are R2 rows for
+    // the same reason. So the one-sided mutation does not model "the declaration lost
+    // depth"; it models "the declaration lost depth but kept its bookkeeping", under
+    // which every nested read is still RECORDED and E4.32 is correctly silent. The
+    // mutation now removes the nested rows from BOTH halves at once, which is what
+    // losing depth actually is, and it must leave every nested read uncovered.
+    ['the declaration forgetting DEPTH — both halves losing their nested rows at once',
+      () => uncoveredReads(reads, declared.filter((p) => !isNestedPath(p)), open.filter((p) => !isNestedPath(p)))],
     ['an engine edit that starts dereferencing a NEW nested path',
       () => uncoveredReads(extractStateReads([`${engineSrc('flow.mjs')}\nconst probe = state.pending.newlyRead\n`, engineSrc('escalate.mjs')]), declared, open)],
   ]
@@ -2702,6 +2723,28 @@ await test('E4.31/AC-C3-2 (cycle 3): the declaration-level mutation battery — 
     const uncovered = run()
     assert.ok(uncovered.length > 0, `mutant survives — ${mutant} left the coverage assertion green`)
   }
+  // The depth mutant must be caught TOTALLY, not incidentally on one path: every path
+  // the engine dereferences at depth loses its cover, which is the property E4.32
+  // exists for stated as an equality rather than as "something went red".
+  assert.deepEqual(uncoveredReads(reads, declared.filter((p) => !isNestedPath(p)), open.filter((p) => !isNestedPath(p))), nestedReads,
+    'the depth mutation left some nested engine read still covered — E4.32 would then pass a declaration that had forgotten that path')
+
+  // The modelling limit, asserted rather than left implicit. Dropping a `shape` row
+  // while its R3 domain row survives is NOT a loss of coverage — the path is still
+  // recorded — so E4.32 does not and must not red on it. That mutant's adequacy claim
+  // is carried by E4.21b, whose depth precondition is the predicate below (the SAME
+  // function E4.21b calls), and additionally by E4.25 (`pending: {}` becomes accepted),
+  // E4.30 (no nested refusal message exists to check) and E4.22 (`pending: {}` reverts
+  // to FAULT-UNTYPED). Naming the case by id and then running its own check is what
+  // keeps this an attribution rather than an assertion about an unnamed mechanism.
+  assert.deepEqual(uncoveredReads(reads, declared.filter((p) => !isNestedPath(p)), open), [],
+    'a `shape` row dropped while its STATE_UNENFORCED row survives now shows as uncovered — '
+    + 'the two halves have stopped being disjoint as type constraints, and E4.31 is modelling the wrong defect')
+  assert.ok(declarationExpressesDepth(declared),
+    'precondition: the shipped declaration must express depth, or E4.21b has nothing to lose')
+  assert.ok(!declarationExpressesDepth(declared.filter((p) => !isNestedPath(p))),
+    'mutant survives — dropping every `shape` row leaves E4.21b\'s depth precondition satisfied, so no case '
+    + 'observes that the contract\'s depth stopped being a row')
   // The row-honesty predicate kills its own mutant.
   const emptyReason = { ...RS.STATE_UNENFORCED[0], reason: '   ' }
   assert.ok(unenforcedRowFault(emptyReason) !== null, 'mutant survives — an unenforced row with an empty reason is accepted as a decision')
