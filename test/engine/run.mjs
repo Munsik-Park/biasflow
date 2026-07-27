@@ -181,15 +181,33 @@ const edgeRowsFor = (capKey) => Object.keys(RT.CAP_EDGES).filter((k) => RT.CAP_E
 
 // Exhaustion target derived from the DECLARATION (+ the recorded prose rows), never
 // from engine/flow.mjs's own exhaustionTarget() — that function is a subject here.
+// `via` names WHICH of the three resolution rules answered, so the case below can
+// assert that all three are still exercised by some cap key. Without it, a rule whose
+// sole witness disappears stops being tested silently — which is exactly how the
+// declared-`escalate` rule (witnessed only by `architect.loop`) went unasserted.
 function expectedExhaustion(sp, capKey) {
   const owner = capKey.split('.')[0]
   const nx = stepOf(sp, owner).next
-  if (mhas(nx, 'cap-exhausted')) return { outcome: 'cap-exhausted', target: mget(nx, 'cap-exhausted') }
+  if (mhas(nx, 'cap-exhausted')) {
+    return { outcome: 'cap-exhausted', target: mget(nx, 'cap-exhausted'), source: 'declaration', via: 'declared:cap-exhausted' }
+  }
   const prose = RT.PROSE_SOURCED.find((r) => r.where === owner && r.what === 'exhaustion-target')
-  if (prose && mhas(nx, prose.value)) return { outcome: prose.value, target: mget(nx, prose.value) }
-  if (mhas(nx, 'escalate')) return { outcome: 'escalate', target: mget(nx, 'escalate') }
+  if (prose && mhas(nx, prose.value)) {
+    return { outcome: prose.value, target: mget(nx, prose.value), source: prose.source, via: 'prose' }
+  }
+  if (mhas(nx, 'escalate')) {
+    return { outcome: 'escalate', target: mget(nx, 'escalate'), source: 'declaration', via: 'declared:escalate' }
+  }
   throw new Error(`no exhaustion target is derivable for ${capKey}`)
 }
+
+// Every cap key the declaration binds — the 7 CAP_EDGES keys the engine counts plus
+// the 2 CAP_LOOPS keys the adapter enforces. Derived from the routing tables and
+// cross-checked against spec/bindings/claude.yaml, so neither family can be dropped.
+const allCapKeys = () => [...new Set([
+  ...Object.values(RT.CAP_EDGES).map((r) => r.capKey),
+  ...Object.values(RT.CAP_LOOPS).map((r) => r.capKey),
+])].sort()
 
 // ---- driving the engine -------------------------------------------------------
 
@@ -687,6 +705,64 @@ await test('E2.5b/AC2: an agent-reported loop outcome routes through resolve() w
     const r = runFlow(sp, { start: step, outcomes: oneShot(step, outcome) })
     assert.equal(r.trace[0].to, mget(nx, outcome))
     assert.ok(!r.trace[0].capKey, 'the engine must not count a CAP_LOOPS key it cannot observe')
+  }
+})
+
+await test('E2.5c/AC2: EVERY bound cap key resolves an exhaustion — outcome, target AND source — from the declaration', () => {
+  const sp = spec()
+  const keys = allCapKeys()
+  assert.deepEqual(keys, Object.keys(sp.binding.caps).sort(),
+    'the cap keys the routing tables claim must be exactly the ones the binding bounds — no key is unresolved '
+    + 'and none is invented; both sides are derived, so a spec/** amendment moves them together')
+  for (const capKey of keys) {
+    const want = expectedExhaustion(sp, capKey)
+    let got
+    assert.doesNotThrow(() => { got = FLOW.exhaustionTarget(sp, capKey) },
+      `${capKey} has no derivable exhaustion target — an exhausted cap with nowhere to go cannot satisfy invariant 6`)
+    assert.deepEqual({ outcome: got.outcome, target: got.target, source: got.source },
+      { outcome: want.outcome, target: want.target, source: want.source },
+      `${capKey}: the owning step supplies the target, and the source records where it came from`)
+  }
+  // `refine.retry` is the recorded counterexample to "an exhausted cap escalates"
+  // (DCR-2): it abandons the refactor and proceeds. Derived, so the case states the
+  // declaration rather than a slogan about it.
+  assert.notEqual(expectedExhaustion(sp, 'refine.retry').target, 'escalate')
+  assert.equal(expectedExhaustion(sp, 'refine.retry').target, mget(stepOf(sp, 'refine').next, 'cap-exhausted'))
+})
+
+await test('E2.5c/AC2: all THREE exhaustion-resolution rules are still witnessed by some cap key', () => {
+  const sp = spec()
+  const witnesses = {}
+  for (const capKey of allCapKeys()) {
+    const { via } = expectedExhaustion(sp, capKey)
+    ;(witnesses[via] = witnesses[via] || []).push(capKey)
+  }
+  assert.deepEqual(Object.keys(witnesses).sort(), ['declared:cap-exhausted', 'declared:escalate', 'prose'],
+    'a resolution rule whose last witness disappears must fail loudly here rather than quietly stop being tested — '
+    + 'the declared:escalate rule has exactly one witness, which is how it went unasserted in the first place')
+  for (const [via, keys] of Object.entries(witnesses)) {
+    assert.ok(keys.length > 0, `${via} has no witness`)
+  }
+})
+
+await test('E2.5d/AC2 (invariant 6): a CAP_LOOPS exhaustion lands on the declared target and never re-enters the step', () => {
+  const sp = spec()
+  for (const [step, row] of Object.entries(RT.CAP_LOOPS)) {
+    const cap = RT.capValue(sp, row.capKey)
+    const ex = expectedExhaustion(sp, row.capKey)
+    // D3 / U-6: the engine structurally cannot observe a loop's internal rounds, so
+    // the exhaustion arrives as the adapter's reported outcome. What the executor
+    // still owns — and what invariant 6 asserts — is where that outcome LANDS and
+    // that the bounded step is not re-entered.
+    const r = runFlow(sp, {
+      start: step, maxSteps: 20, seedCounters: { [row.capKey]: cap },
+      outcomes: oneShot(step, ex.outcome),
+    })
+    assert.equal(r.trace[0].to, ex.target, `${row.capKey}: exhaustion must route to the declared target`)
+    assert.equal(r.trace.filter((h) => h.from === step).length, 1, `${row.capKey}: ${step} ran more than once`)
+    assert.ok(!r.trace.some((h) => h.to === step), `${row.capKey}: the bounded step was re-entered — invariant 6`)
+    assert.equal(r.state.counters[row.capKey], cap,
+      `${row.capKey}: the engine must not count a loop cap it cannot observe (D3) — the seeded value must be untouched`)
   }
 })
 
