@@ -40,6 +40,21 @@ export class MissingSlotError extends Error {
   }
 }
 
+// The trust boundary the loader deliberately does not police: whether a well-typed
+// step id is a member of THIS spec is the document's agreement with a spec, not a
+// property of the document (the run-state contract's clause R3). The question is answered
+// here, where the spec is in hand — and answered TYPED, so a resume that cannot
+// resolve its step is identifiable by class and `code` instead of escaping as a bare
+// Error. The message is unchanged.
+export class StepResolutionError extends Error {
+  constructor(stepId) {
+    super(`no such step: ${stepId}`)
+    this.name = 'StepResolutionError'
+    this.code = 'no-such-step'
+    this.step = stepId
+  }
+}
+
 // ---- slot sourcing -------------------------------------------------------------
 //
 // One row per (step, role, slot) triple derived from the declaration. A slot's
@@ -287,7 +302,7 @@ export function advance(spec, state, env = {}) {
 
   const stepId = state.pending ? state.pending.step : state.step
   const step = spec.steps.get(stepId)
-  if (!step) throw new Error(`no such step: ${stepId}`)
+  if (!step) throw new StepResolutionError(stepId)
 
   let outcome
   if (step.kind === 'mechanical') {
