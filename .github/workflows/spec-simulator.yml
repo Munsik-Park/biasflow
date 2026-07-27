@@ -25,6 +25,7 @@ on:
       - 'spec/**'
       - 'engine/**'
       - 'test/spec/**'
+      - 'test/engine/**'
       - 'docs/cycle-digest.jsonl'
       - '.claude/hooks/check-autoflow-gate.sh'
       - '.github/workflows/spec-simulator.yml'
@@ -34,6 +35,7 @@ on:
       - 'spec/**'
       - 'engine/**'
       - 'test/spec/**'
+      - 'test/engine/**'
       - 'docs/cycle-digest.jsonl'
       - '.claude/hooks/check-autoflow-gate.sh'
       - '.github/workflows/spec-simulator.yml'
@@ -56,3 +58,6 @@ jobs:
 
       - name: Run spec simulator suite
         run: node test/spec/run.mjs
+
+      - name: Run M1 flow-engine suite
+        run: node test/engine/run.mjs

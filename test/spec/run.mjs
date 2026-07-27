@@ -1527,86 +1527,12 @@ function simulate(sp, { start = 'preflight', outcomes, maxSteps = 400 }) {
   return { trace, counters, terminal }
 }
 
-const oneShot = (step, outcome) => {
-  let fired = false
-  return (s) => (!fired && s === step ? ((fired = true), outcome) : null)
-}
-
-// The main-line outcome table: every step's "keep going" answer, so a scenario
-// only has to override the step under test.
-const MAIN_LINE = {
-  preflight: 'ready',
-  diagnose: 'code-change-needed-feat',
-  architect: 'converged',
-  gate_plan: 'pass',
-  dispatch: 'assigned',
-  red: 'red-confirmed',
-  green: 'done',
-  verify: 'pass',
-  refine: 'green-reconfirmed',
-  validate: 'done',
-  audit: 'pass',
-  gate_quality: 'pass',
-  deliver: 'pushed',
-  integrate: 'pass',
-  gate_hypothesis: 'pass',
-  handoff: null,
-}
-const mainLine = (overrides = {}) => (s, state) => {
-  const o = Object.prototype.hasOwnProperty.call(overrides, s) ? overrides[s] : MAIN_LINE[s]
-  return typeof o === 'function' ? o(s, state) : o
-}
-
-// AC2.0 — the 44 authored edge cases. The expected targets are authored from the
-// declarations; R12 then asserts this authored/traversed set EQUALS the set the
-// engine derives from spec/steps/*.yaml, so an added edge fails CI until a case
-// exists and a case naming a removed edge fails too.
-const EDGES_EXPECTED = [
-  ['architect', 'converged', 'gate_plan'],
-  ['architect', 'escalate', 'escalate'],
-  ['audit', 'pass', 'gate_quality'],
-  ['audit', 'fail', 'green'],
-  ['audit', 'cap-exhausted', 'escalate'],
-  ['deliver', 'pushed', 'integrate'],
-  ['diagnose', 'code-change-needed-bug', 'gate_hypothesis'],
-  ['diagnose', 'code-change-needed-feat', 'architect'],
-  ['diagnose', 'already-satisfied', 'close'],
-  ['diagnose', 'non-code-lever', 'escalate'],
-  ['diagnose', 'intake-prerequisite-missing', 'escalate'],
-  ['diagnose', 'loop-check-match', 'escalate'],
-  ['dispatch', 'assigned', 'red'],
-  ['gate_hypothesis', 'pass', 'architect'],
-  ['gate_hypothesis', 'fail', 'diagnose'],
-  ['gate_hypothesis', 'non-code-root-cause', 'escalate'],
-  ['gate_hypothesis', 'cap-exhausted', 'escalate'],
-  ['gate_plan', 'pass', 'dispatch'],
-  ['gate_plan', 'fail', 'architect'],
-  ['gate_plan', 'cap-exhausted', 'escalate'],
-  ['gate_quality', 'pass', 'deliver'],
-  ['gate_quality', 'fail', 'red'],
-  ['gate_quality', 'cap-exhausted', 'escalate'],
-  ['green', 'done', 'verify'],
-  ['green', 'ac-contradiction', 'verify'],
-  ['handoff', 'review-clean', 'end'],
-  ['handoff', 'review-findings', 'diagnose'],
-  ['handoff', 'ci-code-failure', 'red'],
-  ['handoff', 'env-failure', 'handoff'],
-  ['handoff', 'cap-exhausted', 'escalate'],
-  ['integrate', 'pass', 'handoff'],
-  ['integrate', 'fail', 'red'],
-  ['preflight', 'ready', 'diagnose'],
-  ['preflight', 'paused-prior-cycle', 'escalate'],
-  ['preflight', 'dirty-unresolvable', 'escalate'],
-  ['red', 'red-confirmed', 'green'],
-  ['refine', 'green-reconfirmed', 'validate'],
-  ['refine', 'cap-exhausted', 'validate'],
-  ['validate', 'done', 'audit'],
-  ['verify', 'pass', 'refine'],
-  ['verify', 'test-issue', 'red'],
-  ['verify', 'impl-issue', 'green'],
-  ['verify', 'design-contradiction', 'architect'],
-  ['verify', 'undecidable', 'escalate'],
-]
+// The mock-outcome apparatus (`oneShot` / `MAIN_LINE` / `mainLine`) and the 44-row
+// `EDGES_EXPECTED` table live in test/spec/fixtures/flow-outcomes.mjs (issue #4, D8):
+// the M1 engine suite (test/engine/run.mjs) drives the same rows through the engine's
+// advance(), so a second copy of the single derived-edge oracle would be exactly the
+// drift the table exists to prevent. E6.3 asserts the one-binding property repo-wide.
+import { oneShot, MAIN_LINE, mainLine, EDGES_EXPECTED } from './fixtures/flow-outcomes.mjs'
 
 for (const [step, outcome, target] of EDGES_EXPECTED) {
   await test(`AC2.0 edge ${step}:${outcome} → ${target}`, () => {
@@ -2526,15 +2452,22 @@ await test('AC2.7: no network / child_process module is imported anywhere in eng
   }
 })
 
-await test('AC2.7/AC4.4 (mechanizable half): engine/** imports only node: builtins — no bare specifier', () => {
-  for (const [name, src] of engineSources()) {
+// E6.1 (issue #4): the same structural surface, widened to the files this cycle adds.
+// engine/** stays directory-derived via engineSources(), so engine/cli.mjs and any
+// later module are covered without an edit; the two new test files are named because
+// they live outside that directory. package.json must still not exist.
+await test('AC2.7/AC4.4 (mechanizable half): engine/**, test/engine/run.mjs and the flow-outcomes fixture import only node: builtins — no bare specifier', () => {
+  const extra = ['test/engine/run.mjs', 'test/spec/fixtures/flow-outcomes.mjs']
+    .filter((rel) => existsSync(join(root, rel)))
+    .map((rel) => [rel, readRepo(rel)])
+  for (const [name, src] of [...engineSources().map(([f, s]) => [`engine/${f}`, s]), ...extra]) {
     for (const m of src.matchAll(/^\s*(?:import|export)[^'"]*from\s*['"]([^'"]+)['"]/gm)) {
       const spec_ = m[1]
       assert.ok(spec_.startsWith('node:') || spec_.startsWith('.') || spec_.startsWith('/'),
-        `engine/${name} imports the bare specifier "${spec_}" — the repo has no package.json`)
+        `${name} imports the bare specifier "${spec_}" — the repo has no package.json`)
     }
-    assert.ok(!existsSync(join(root, 'package.json')), 'a package.json must not be introduced')
   }
+  assert.ok(!existsSync(join(root, 'package.json')), 'a package.json must not be introduced')
 })
 
 await test('AC3.2 structural: replay.mjs is import-clean of any disk-writing helper', () => {
