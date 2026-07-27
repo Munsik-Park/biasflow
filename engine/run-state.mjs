@@ -18,6 +18,7 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 export const STATE_VERSION = 1
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
+const isNullableObject = (v) => v === null || isPlainObject(v)
 
 // The per-field type contract of §2.1, total over the closed key set minus `version`
 // (which carries its own, earlier rejection). `expected` is the phrase the refusal
@@ -27,10 +28,10 @@ export const STATE_FIELDS = Object.freeze({
     expected: 'an object whose values are non-negative integers',
     ok: (v) => isPlainObject(v) && Object.values(v).every((n) => Number.isInteger(n) && n >= 0),
   },
-  halt: { expected: 'null or an object', ok: (v) => v === null || isPlainObject(v) },
+  halt: { expected: 'null or an object', ok: isNullableObject },
   history: { expected: 'an array', ok: (v) => Array.isArray(v) },
   issue: { expected: 'a string', ok: (v) => typeof v === 'string' },
-  pending: { expected: 'null or an object', ok: (v) => v === null || isPlainObject(v) },
+  pending: { expected: 'null or an object', ok: isNullableObject },
   status: { expected: 'a string', ok: (v) => typeof v === 'string' },
   step: { expected: 'a string', ok: (v) => typeof v === 'string' },
   terminal: { expected: 'null or a string', ok: (v) => v === null || typeof v === 'string' },
