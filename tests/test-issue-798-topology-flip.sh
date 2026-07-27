@@ -443,6 +443,10 @@ else
     "test/spec/fixtures/self-test-pass.mjs"
     "test/spec/fixtures/replay-baseline.json"
     "test/spec/fixtures/replay-baseline-records.json"
+    # #4 M1 flow engine: the second (engine) suite + the mock-outcome table
+    # extracted so the 44-row derived-edge oracle exists in exactly one place.
+    "test/engine/run.mjs"
+    "test/spec/fixtures/flow-outcomes.mjs"
     "test/spec/manual-scenarios.md"
     "test/spec/run.mjs"
   )
