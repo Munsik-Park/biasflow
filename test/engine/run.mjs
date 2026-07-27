@@ -3668,7 +3668,27 @@ await test('E4.44/AC-C4-5 (cycle 4): the non-regression baseline and the new ref
   }
 })
 
-await test('E4.45/AC-C4-6 (cycle 4): the cycle\'s change surface is pinned to three files, and run-state.mjs comment-only', () => {
+// The path HANDOFF step 6.7 appends its cycle digest to, DERIVED from the emitter
+// rather than transcribed: the script owns the location, so a rename moves this with
+// it instead of silently widening the surface. Parsed rather than executed — the
+// suite is stdlib-only and offline.
+function cycleDigestPath() {
+  const rel = 'scripts/handoff/emit-cycle-digest.sh'
+  if (!existsSync(join(root, rel))) return null
+  const m = /^DIGEST="\$REPO_ROOT\/(.+)"\s*$/m.exec(readRepo(rel))
+  return m ? m[1] : null
+}
+
+// The sources setup/manifest.json registers. The derived-artifact rule is a
+// MECHANICAL set-intersection, not a judgment call: the regenerated manifest is
+// admitted into a cycle's surface exactly when the cycle touched one of these.
+function manifestSources() {
+  const rel = 'setup/manifest.json'
+  if (!existsSync(join(root, rel))) return null
+  try { return (JSON.parse(readRepo(rel)).artifacts || []).map((a) => a.source) } catch { return null }
+}
+
+await test('E4.45/AC-C4-6 (cycle 4): the cycle\'s change surface is pinned — the implementation surface stays confined, and each rider is a reasoned row', () => {
   // Vacuously green at the cycle base and load-bearing the moment GREEN commits.
   const base = '359bc8b'
   const out = gitTry(['diff', '--name-only', `${base}..HEAD`])
@@ -3676,8 +3696,62 @@ await test('E4.45/AC-C4-6 (cycle 4): the cycle\'s change surface is pinned to th
   const files = out.split('\n').map((s) => s.trim()).filter(Boolean)
   const FREE = ['engine/flow.mjs', 'test/engine/run.mjs']
   const COMMENT_ONLY = 'engine/run-state.mjs'
-  const outside = files.filter((f) => !FREE.includes(f) && f !== COMMENT_ONLY)
-  assert.deepEqual(outside, [], `files outside the cycle's allowed set: ${outside.join(', ')}`)
+
+  // ---- rider 1: the HANDOFF step-6.7 cycle digest -----------------------------
+  //
+  // AUTHORITY: docs/autoflow-guide.md > HANDOFF step 6.7 MANDATES this append and
+  // describes the resulting push as a PR co-ride on the cycle's own dev branch,
+  // explicitly "CI re-runs on the docs-only delta (benign)". So a cycle that reaches
+  // step 6.7 necessarily carries this file, and a pin that reds on it reds on a
+  // mandated step of the process it is running inside — for every future cycle on
+  // this repo, not only for this issue.
+  //
+  // This is NOT a broadened glob and NOT a "docs are fine" escape: exactly one path
+  // is admitted, it is DERIVED from the emitter that owns it, and it carries a
+  // CONTENT constraint of its own — the digest is a write-only-forward JSON Lines
+  // plane (step 6.7 [DENY]), so its diff must be APPEND-ONLY. A truncating or
+  // rewriting edit to the digest is still outside the surface.
+  const digest = cycleDigestPath()
+  assert.ok(digest,
+    'the cycle-digest emitter no longer declares its append target where this case can derive it — re-derive the '
+    + 'admitted path from scripts/handoff/emit-cycle-digest.sh before trusting this pin')
+
+  // ---- rider 2: the regenerated manifest, admitted only ON ITS CONDITION -------
+  //
+  // AUTHORITY: docs/autoflow-guide.md > GREEN step 3 / VALIDATE step 5 (Change
+  // Surface Rules > Derived artifacts). The manifest is staged in the SAME commit as
+  // the manifest-registered source it derives from, and the trigger is a mechanical
+  // set-intersection. It is therefore admitted only when that intersection actually
+  // fires — never unconditionally, or the pin would stop noticing a manifest that
+  // rode along for no reason.
+  const MANIFEST = 'setup/manifest.json'
+  const sources = manifestSources()
+  assert.ok(Array.isArray(sources), `${MANIFEST} is unreadable, so the derived-artifact condition cannot be evaluated`)
+  const touchedSources = files.filter((f) => f !== MANIFEST && sources.includes(f))
+  const manifestAdmitted = touchedSources.length > 0
+
+  const admitted = new Set([...FREE, COMMENT_ONLY, digest, ...(manifestAdmitted ? [MANIFEST] : [])])
+  const outside = files.filter((f) => !admitted.has(f))
+  assert.deepEqual(outside, [],
+    `files outside the cycle's allowed set: ${outside.join(', ')} — the allowed set is `
+    + `[${[...admitted].join(', ')}]${manifestAdmitted ? ` (${MANIFEST} admitted because the cycle touched ${touchedSources.join(', ')})` : ''}`)
+
+  // This cycle's implementation surface touches no manifest-registered source, so the
+  // manifest row must be INERT. Asserted rather than assumed: a manifest that appears
+  // without its trigger is exactly the unexamined rider the pin exists to catch.
+  if (!manifestAdmitted) {
+    assert.ok(!files.includes(MANIFEST),
+      `${MANIFEST} rode along while the cycle touched none of its registered sources — the derived-artifact rule did not fire, so nothing authorises it`)
+  }
+
+  // The digest's own content constraint.
+  if (files.includes(digest)) {
+    const d = gitTry(['diff', `${base}..HEAD`, '--', digest]) || ''
+    const removed = d.split('\n').filter((l) => l.startsWith('-') && !l.startsWith('---'))
+    assert.deepEqual(removed, [],
+      `${digest} is a write-only-forward plane and its diff removes ${removed.length} line(s); step 6.7 appends only`)
+  }
+
   if (files.includes(COMMENT_ONLY)) {
     // Strictly stronger than excluding the file: the citation sweep GREEN must do is
     // admitted, while the STATE_FIELDS / STATE_UNENFORCED contract change AC-C4 rules
@@ -3690,6 +3764,13 @@ await test('E4.45/AC-C4-6 (cycle 4): the cycle\'s change surface is pinned to th
       .filter((l) => l !== '' && !l.startsWith('//'))
     assert.deepEqual(code, [], `${COMMENT_ONLY} may be swept for citations but its contract is frozen; non-comment lines changed:\n        ${code.join('\n        ')}`)
   }
+
+  // The exclusions the case is actually FOR, asserted positively so admitting the two
+  // riders cannot be read as relaxing them.
+  for (const frozen of ['engine/cli.mjs', 'engine/mechanical.mjs', 'engine/gate.mjs', 'engine/routing.mjs']) {
+    assert.ok(!files.includes(frozen), `${frozen} is unconditionally outside this cycle's surface`)
+  }
+  assert.deepEqual(files.filter((f) => f.startsWith('spec/')), [], 'spec/** is frozen for this cycle')
 })
 
 await test('E4.47/AC-C4-1,2 (cycle 4): the predicate\'s far edge — a `scores` that is PRESENT but is not a score table', () => {
