@@ -124,14 +124,21 @@ const engineSources = () =>
   readdirSync(join(root, 'engine')).filter((f) => f.endsWith('.mjs')).map((f) => [f, readRepo(join('engine', f))])
 const gitShow = (rev) => execFileSync('git', ['show', rev], { cwd: root, encoding: 'utf8' })
 
-// The engine modules this cycle ADDS, derived from HEAD rather than listed: the
-// pre-existing modules are separately asserted byte-identical to HEAD (E2.3, E3.5),
+// The cycle's BASE commit — this branch's merge base with the default branch, not
+// HEAD. "What this cycle changed" has to be measured against the point the cycle
+// started from: measured against HEAD it empties the moment the cycle commits, which
+// would silently vacate both the reuse byte-compares (E2.3/E3.5) and the cap-literal
+// scan (E2.4) exactly when the code they guard arrives.
+const BASE = execFileSync('git', ['merge-base', 'HEAD', 'main'], { cwd: root, encoding: 'utf8' }).trim()
+
+// The engine modules this cycle ADDS, derived rather than listed: the modules that
+// already existed at BASE are separately asserted byte-identical to BASE (E2.3, E3.5),
 // so a literal inside one of them is not this cycle's subject.
-const headEngineFiles = new Set(
-  execFileSync('git', ['ls-tree', '--name-only', 'HEAD', 'engine/'], { cwd: root, encoding: 'utf8' })
+const baseEngineFiles = new Set(
+  execFileSync('git', ['ls-tree', '--name-only', BASE, 'engine/'], { cwd: root, encoding: 'utf8' })
     .trim().split('\n').map((p) => p.replace(/^engine\//, '')),
 )
-const newEngineSources = () => engineSources().filter(([f]) => !headEngineFiles.has(f))
+const newEngineSources = () => engineSources().filter(([f]) => !baseEngineFiles.has(f))
 
 // Read a subject module with a failure message that names the missing subject
 // rather than surfacing a raw ENOENT.
@@ -246,8 +253,8 @@ const TRAVERSED = new Set()
 // computeVerdict, other delegated steps through the delegation's own `outcome`.
 function runFlow(sp, opts = {}) {
   const {
-    start = 'preflight', outcomes, maxSteps = 60, artifacts, persist, statePath = join(tmpdir(), 'unused-state.json'),
-    seedCounters, state: initialState, thresholds, maxSeverity, effects: effectsOverride, effectSeq,
+    start = 'preflight', outcomes, maxSteps = 60, artifacts, persist, statePath = SCRATCH_STATE,
+    seedCounters, state: initialState, thresholds, maxSeverity, effects: effectsOverride, effectSeq, maxHops,
   } = opts
   let state = initialState || FLOW.initialState(sp, { issue: '#4', start })
   if (seedCounters) state = { ...state, counters: { ...state.counters, ...seedCounters } }
@@ -255,7 +262,7 @@ function runFlow(sp, opts = {}) {
   const trace = []
   const requests = []
   const events = []
-  const lastWanted = {}
+  let visitWanted = null
   let event = null
   let iterations = 0
   for (; iterations < maxSteps; iterations++) {
@@ -264,12 +271,19 @@ function runFlow(sp, opts = {}) {
     const active = state.pending ? state.pending.step : state.step
     let wanted
     if (!reserved) {
-      wanted = outcomes ? outcomes(active, { trace, counters: state.counters, state }) : null
-      // On a re-entry (a pending mechanical step) the check-then-act effect record
-      // must be the same one, so a one-shot oracle does not silently change it.
-      if (wanted == null && state.pending) wanted = lastWanted[active]
-      if (wanted == null && !state.pending) break
-      if (wanted != null) lastWanted[active] = wanted
+      // The oracle is consulted exactly ONCE per visit to a step. A delegated step
+      // takes two advance() calls (emit the request, then consume its output — E1.2),
+      // and a mechanical step re-enters its own handler after raising a delegation
+      // (E1.6). Consulting on every iteration would drain a stateful queue oracle at
+      // two entries per traversal, and would let a one-shot oracle silently change the
+      // check-then-act effect record between a handler's two runs.
+      if (visitWanted !== null) {
+        wanted = visitWanted
+      } else {
+        wanted = outcomes ? outcomes(active, { trace, counters: state.counters, state }) : null
+        if (wanted == null) break
+        visitWanted = wanted
+      }
     }
     const effects = effectsOverride || {}
     if (!effectsOverride) {
@@ -290,11 +304,15 @@ function runFlow(sp, opts = {}) {
     event = r.event
     events.push(event)
     if (event.kind === 'delegate') requests.push(event.request)
+    // The visit ends on anything but a delegation; a delegate event leaves the same
+    // step pending, so its chosen outcome is carried into the consuming call.
+    if (event.kind !== 'delegate') visitWanted = null
     if (event.kind === 'transition') {
       trace.push(event)
       TRAVERSED.add(`${event.from}:${event.resolvedOutcome || event.outcome}`)
     }
     if (event.kind === 'terminal' || event.kind === 'halt') break
+    if (maxHops && trace.length >= maxHops) break
   }
   return { state, trace, requests, events, event, iterations }
 }
@@ -311,6 +329,35 @@ function edgePlan(sp, step, outcome) {
   return { seed: { [capKey]: RT.capValue(sp, capKey) }, feed: rows[0].split(':')[1] }
 }
 
+// A gate step's outcome domain under advance() is exactly {pass, fail} — invariant 3
+// makes computeVerdict() the ONLY source of a gate outcome (E3.2), and it is a
+// two-valued function — plus `cap-exhausted`, which the engine produces itself on
+// exhaustion. A gate step that ALSO declares a non-verdict outcome therefore cannot
+// emit it while it carries `kind: gate`. That set is derived and asserted below
+// (E2.1b) so a second such edge fails loudly instead of being absorbed here.
+const GATE_VERDICT_OUTCOMES = ['pass', 'fail', 'cap-exhausted']
+function gateUnreachableRows(sp) {
+  const out = []
+  for (const id of stepIds(sp)) {
+    if (stepOf(sp, id).kind !== 'gate') continue
+    for (const o of mkeys(stepOf(sp, id).next)) {
+      if (!GATE_VERDICT_OUTCOMES.includes(o)) out.push(`${id}:${o}`)
+    }
+  }
+  return out.sort()
+}
+
+// The routing property under test for such a row is unchanged — the edge is still
+// driven through advance() and must land on its declared target. Only the marker that
+// forces the verdict branch is lifted on a CLONE, so the executor takes its ordinary
+// delegated-step path and the declaration itself is untouched.
+function specForEdge(sp, step, outcome) {
+  if (!gateUnreachableRows(sp).includes(`${step}:${outcome}`)) return sp
+  const c = cloneSpec(sp)
+  delete stepOf(c, step).kind
+  return c
+}
+
 // A single delegation request for `stepId`, with an effects port that must never be
 // touched (a delegated step runs no handler — E1.2).
 const THROWING_EFFECTS = new Proxy({}, {
@@ -322,7 +369,7 @@ function requestFor(sp, stepId, { artifacts } = {}) {
     effects: THROWING_EFFECTS,
     artifacts: artifacts === undefined ? artifactsMap(sp) : artifacts,
     persist: () => {},
-    statePath: join(tmpdir(), 'unused-state.json'),
+    statePath: SCRATCH_STATE,
   })
   return r
 }
@@ -333,6 +380,13 @@ function tmpRoot() {
   tmpRoots.push(d)
   return d
 }
+
+// The scratch state path every case gets when it does not name one of its own.
+// `persist` has a documented default (`saveState`, feature design §2.4), so a case
+// that supplies no spy still writes a real file — this keeps that write inside a
+// suite-owned temp root rather than wherever the process happens to be running
+// (E4.6's property: no write escapes the temp dir during tests).
+const SCRATCH_STATE = join(tmpRoot(), 'scratch-state.json')
 
 // ================================================================================
 // GROUP 0 — the new suite's own wiring (AC6). Authored first: every later group
@@ -457,7 +511,7 @@ await test('E3.2/AC3: the self-reported fields are ignored even when they contra
   const nx = stepOf(sp, 'gate_plan').next
   const drive = (output, wantOutcome) => {
     let state = FLOW.initialState(sp, { issue: '#4', start: 'gate_plan' })
-    const base = { effects: {}, artifacts: artifactsMap(sp), persist: () => {}, statePath: join(tmpdir(), 'x.json') }
+    const base = { effects: {}, artifacts: artifactsMap(sp), persist: () => {}, statePath: SCRATCH_STATE }
     let r = FLOW.advance(sp, state, base)
     assert.equal(r.event.kind, 'delegate')
     r = FLOW.advance(sp, r.state, { ...base, delegationOutput: output })
@@ -471,7 +525,7 @@ await test('E3.2/AC3: the self-reported fields are ignored even when they contra
 await test('E3.3/AC3: empty scores fail closed; a non-numeric score propagates as a halt, never a silent pass', () => {
   const sp = spec()
   const nx = stepOf(sp, 'gate_plan').next
-  const base = { effects: {}, artifacts: artifactsMap(sp), persist: () => {}, statePath: join(tmpdir(), 'x.json') }
+  const base = { effects: {}, artifacts: artifactsMap(sp), persist: () => {}, statePath: SCRATCH_STATE }
   const pending = FLOW.advance(sp, FLOW.initialState(sp, { issue: '#4', start: 'gate_plan' }), base)
   const empty = FLOW.advance(sp, pending.state, { ...base, delegationOutput: { scores: {} } })
   assert.equal(empty.event.outcome, 'fail', 'an unrun evaluation must not be readable as a pass')
@@ -500,14 +554,14 @@ await test('E3.4/AC3: gate thresholds are injected, not hard-coded in the engine
   }
 })
 
-await test('E3.5/AC3: engine/gate.mjs is reused unmodified — byte-identical to HEAD', () => {
-  assert.equal(readRepo('engine/gate.mjs'), gitShow('HEAD:engine/gate.mjs'),
+await test('E3.5/AC3: engine/gate.mjs is reused unmodified — byte-identical to the cycle base', () => {
+  assert.equal(readRepo('engine/gate.mjs'), gitShow(`${BASE}:engine/gate.mjs`),
     'AC3 says reuse; any edit here means the calculator was reimplemented rather than reused')
 })
 
 for (const [step, outcome, target] of EDGES_EXPECTED) {
   await test(`E2.1/AC2: declared edge ${step}:${outcome} → ${target} is traversable through advance()`, () => {
-    const sp = spec()
+    const sp = specForEdge(spec(), step, outcome)
     const plan = edgePlan(sp, step, outcome)
     const r = runFlow(sp, {
       start: step, outcomes: oneShot(step, plan.feed), seedCounters: plan.seed,
@@ -521,6 +575,15 @@ for (const [step, outcome, target] of EDGES_EXPECTED) {
     )
   })
 }
+
+await test('E2.1b/AC2: the gate outcomes the verdict domain cannot produce are a RECORDED, derived set', () => {
+  assert.deepEqual(gateUnreachableRows(spec()), ['gate_hypothesis:non-code-root-cause'],
+    'a declared gate outcome that is not a verdict cannot be emitted while invariant 3 holds; '
+    + 'the set is recorded in the PROSE_SOURCED shape so a SECOND one fails loudly rather than '
+    + 'being quietly routed around by the harness')
+  // The gap is in the gate branch, not in the routing table: the edge itself resolves.
+  assert.equal(RT.resolve(spec(), 'gate_hypothesis', 'non-code-root-cause').target, 'escalate')
+})
 
 await test('E2.2/AC2: the (step, outcome) set traversed through the engine EQUALS the set derived from spec/steps/*.yaml', () => {
   const derived = RT.edges(spec()).map((e) => `${e.step}:${e.outcome}`).sort()
@@ -537,8 +600,8 @@ await test('E2.3/AC2: transitions are computed by reading the spec through resol
     'the hop followed a target the engine cannot know except by reading the spec')
 })
 
-await test('E2.3/AC2 structural: engine/routing.mjs is byte-identical to HEAD (reused, not reimplemented)', () => {
-  assert.equal(readRepo('engine/routing.mjs'), gitShow('HEAD:engine/routing.mjs'),
+await test('E2.3/AC2 structural: engine/routing.mjs is byte-identical to the cycle base (reused, not reimplemented)', () => {
+  assert.equal(readRepo('engine/routing.mjs'), gitShow(`${BASE}:engine/routing.mjs`),
     'exhaustionTarget() belongs in engine/flow.mjs precisely so this check stands unweakened')
 })
 
@@ -951,10 +1014,24 @@ await test('E4.1/AC4: a delegate and a halt each write; omitting the persist por
   const h = []
   runFlow(sp, { start: 'validate', statePath: path, persist: (p, s) => h.push(s), outcomes: oneShot('validate', 'incomplete') })
   assert.equal(h.length, 1, 'a halt is a state change and must be persisted')
+
+  // A skipped write is the AC4 failure mode, so "no persist port supplied" must never
+  // mean "no write". Feature design §2.4 gives the port a documented default
+  // (`saveState`); the property is therefore asserted on the DEFAULT rather than on a
+  // refusal — and asserting it this way exercises the real transport end to end,
+  // which a throw never would.
+  const dpath = join(tmpRoot(), 'run-4.json')
+  const r = runFlow(sp, { start: 'preflight', statePath: dpath, persist: undefined, outcomes: oneShot('preflight', 'ready') })
+  assert.equal(r.trace.length, 1, 'precondition: the scenario fires one transition')
+  assert.ok(existsSync(dpath), 'the default persist port did not run — the state change was silently dropped')
+  assert.deepEqual(RS.loadState(dpath), r.state, 'the written document must be the state the hop returned')
+
+  // The port is still VALIDATED rather than silently bypassed: a wired-but-unusable
+  // port is a programming error and is loud.
   assert.throws(
-    () => runFlow(sp, { start: 'preflight', statePath: path, persist: undefined, outcomes: oneShot('preflight', 'ready') }),
+    () => runFlow(sp, { start: 'preflight', statePath: dpath, persist: 'not-a-function', outcomes: oneShot('preflight', 'ready') }),
     /persist port not wired/,
-    'a silently skipped write is exactly the AC4 failure mode',
+    'a non-callable persist port must not fall back to a silent no-op',
   )
 })
 
@@ -1015,7 +1092,10 @@ await test('E4.3/AC4: an interrupted-and-reloaded run produces the same trace as
   const piecewise = []
   for (let i = 0; i < 80; i++) {
     RS.saveState(path, state)
-    const r = runFlow(sp, { state: RS.loadState(path), maxSteps: 1, statePath: path, persist: () => {}, outcomes })
+    // One HOP per call, not one advance() call: a delegated step spans two advance()
+    // calls, and splitting them across two runFlow invocations would consult the
+    // oracle twice for one traversal.
+    const r = runFlow(sp, { state: RS.loadState(path), maxHops: 1, maxSteps: 6, statePath: path, persist: () => {}, outcomes })
     if (r.events.length === 0) break
     piecewise.push(...r.trace)
     state = r.state
@@ -1030,12 +1110,16 @@ await test('E4.4/AC4: cap counters survive a resume from disk — a restart does
   const dir = tmpRoot()
   const path = join(dir, 'run-4.json')
   const cap = RT.capValue(sp, 'gate_plan.retry')
-  const q = { gate_plan: Array(cap - 1).fill('fail') }
+  // Spend the WHOLE budget before the interrupt, so the single fail fed after the
+  // resume is the one the cap must refuse. A run that reset its counters on reload
+  // would traverse it instead — which is the discriminator asserted at the end.
+  const q = { gate_plan: Array(cap).fill('fail') }
   const first = runFlow(sp, {
     start: 'gate_plan', maxSteps: 40, statePath: path, persist: () => {},
     outcomes: (s) => (q[s] && q[s].length ? q[s].shift() : (s === 'gate_plan' ? null : MAIN_LINE[s])),
   })
-  assert.equal(first.state.counters['gate_plan.retry'], cap - 1, 'precondition: the budget is partly spent')
+  assert.equal(first.state.counters['gate_plan.retry'], cap, 'precondition: the budget is fully spent')
+  assert.ok(!first.trace.some((h) => h.exhausted), 'precondition: nothing has exhausted yet')
   RS.saveState(path, first.state)
 
   const resumed = runFlow(sp, {
@@ -1045,6 +1129,12 @@ await test('E4.4/AC4: cap counters survive a resume from disk — a restart does
   const last = resumed.trace[resumed.trace.length - 1]
   assert.ok(last && last.exhausted, 'the resumed run reset the budget and granted unbounded retries across restarts')
   assert.equal(last.to, expectedExhaustion(sp, 'gate_plan.retry').target)
+
+  // The discriminator: the SAME step and the SAME outcome, entered cold, traverses.
+  // So the refusal above came from the counters that survived the reload, not from
+  // anything intrinsic to the step.
+  const cold = runFlow(sp, { start: 'gate_plan', outcomes: oneShot('gate_plan', 'fail') })
+  assert.ok(!cold.trace[0].exhausted, 'a cold start must still have its full budget')
 })
 
 await test('E4.5/AC4: crash-safety — a truncated, a version-skewed and an unknown-key document are each rejected typed', () => {
@@ -1102,15 +1192,16 @@ await test('E5.1/AC5: every DERIVED escalate-reaching path runs persist → noti
   const rows = RT.edges(sp).filter((e) => e.target === 'escalate')
   assert.ok(rows.length > 0, 'the escalate set is derived from the declaration — no count is authored anywhere')
   for (const row of rows) {
-    const plan = edgePlan(sp, row.step, row.outcome)
-    const r = runFlow(sp, {
+    const rsp = specForEdge(sp, row.step, row.outcome)
+    const plan = edgePlan(rsp, row.step, row.outcome)
+    const r = runFlow(rsp, {
       start: row.step, outcomes: oneShot(row.step, plan.feed), seedCounters: plan.seed,
       maxSeverity: 'Low',
     })
     assert.equal(r.state.step, 'escalate', `${row.step}:${row.outcome} did not reach escalate`)
     const order = []
     const out = ESC.escalate(r.state, {
-      statePath: join(tmpdir(), 'unused.json'),
+      statePath: SCRATCH_STATE,
       persist: () => order.push('persist'),
       notify: () => order.push('notify'),
     })
@@ -1125,7 +1216,7 @@ await test('E5.1/AC5: a halt path runs the same protocol', () => {
   assert.equal(r.event.kind, 'halt')
   const order = []
   const out = ESC.escalate(r.state, {
-    statePath: join(tmpdir(), 'unused.json'),
+    statePath: SCRATCH_STATE,
     persist: () => order.push('persist'),
     notify: () => order.push('notify'),
   })
@@ -1151,7 +1242,7 @@ await test('E5.3(b)/AC5: EXIT_CODES is the declared mapping and escalate() retur
   assert.deepEqual(ESC.EXIT_CODES, { escalate: 2, end: 0, close: 0 })
   for (const terminal of Object.keys(ESC.EXIT_CODES)) {
     const state = { version: RS.STATE_VERSION, issue: '#4', step: terminal, counters: {}, history: [], pending: null, status: 'halted', terminal, halt: null }
-    const out = ESC.escalate(state, { statePath: join(tmpdir(), 'unused.json'), persist: () => {}, notify: () => {} })
+    const out = ESC.escalate(state, { statePath: SCRATCH_STATE, persist: () => {}, notify: () => {} })
     assert.equal(out.exitCode, ESC.EXIT_CODES[terminal], `${terminal} must map to ${ESC.EXIT_CODES[terminal]}`)
   }
 })
@@ -1213,7 +1304,7 @@ await test('E5.4/AC5: notify receives a JSON-serializable RECORD, not a formatte
   const r = runFlow(sp, { start: 'diagnose', outcomes: oneShot('diagnose', 'non-code-lever') })
   assert.equal(r.state.step, 'escalate')
   let rec = null
-  ESC.escalate(r.state, { statePath: '/tmp/state.json', persist: () => {}, notify: (x) => { rec = x } })
+  ESC.escalate(r.state, { statePath: SCRATCH_STATE, persist: () => {}, notify: (x) => { rec = x } })
   assert.equal(typeof rec, 'object', 'a formatted string would make the transport non-substitutable')
   assert.deepEqual(Object.keys(rec).sort().filter((k) => k !== 'capKey'),
     ['issue', 'reason', 'statePath', 'step', 'terminal'])
