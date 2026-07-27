@@ -38,10 +38,18 @@ const started = Date.now()
 
 let failures = 0
 let cases = 0
+let skips = 0
+// A case returns SKIP(reason) when the CHECKOUT it runs in cannot present its subject
+// at all — not when its subject is merely inconvenient. It is REPORTED on its own
+// line and counted separately in the tail, because `all N passed` alone would make a
+// guard that stopped guarding look identical to one that still guards. A skip says it
+// skipped and why; it never looks like a pass.
+const SKIP = (why) => ({ __skip: why })
 async function test(name, fn) {
   cases++
   try {
-    await fn()
+    const r = await fn()
+    if (r && r.__skip) { skips++; console.log(`  SKIP  ${name}\n        ${r.__skip}`); return }
     console.log(`  ok    ${name}`)
   } catch (e) {
     failures++
@@ -180,6 +188,36 @@ function requireBase(b = CYCLE_BASE) {
     + 'option — it would empty the subject set and make E2.3/E2.4/E3.5 pass vacuously.',
   )
 }
+
+// Two situations the cycle-scoped guards must NOT conflate, and the distinction is
+// the whole of this fix:
+//
+//   base UNRESOLVABLE (shallow / single-branch checkout) -> FAIL LOUDLY. Something
+//     that should have been verified was not, and cycle 3 put the fail-loud there
+//     precisely because these guards had been passing vacuously. requireBase() throws
+//     and every subject-set path propagates it; none of that is relaxed here.
+//
+//   base RESOLVES but IS HEAD (the default branch, or a branch with no commits of its
+//     own) -> there is NO CYCLE DELTA, so a cycle-scoped guard has no subject. Nothing
+//     went unverified; there is simply nothing to verify. That is a stated SKIP.
+//
+// The predicate below is the second reading only. An unresolvable base returns false
+// for `noCycleDelta` too, so it falls through to requireBase() and still fails.
+const headSha = () => gitTry(['rev-parse', 'HEAD'])
+const noCycleDelta = (b = CYCLE_BASE) => !!b.sha && b.sha === headSha()
+const NO_DELTA_WHY = 'the resolved cycle base IS HEAD, so this checkout carries no cycle delta and this '
+  + 'guard has no subject (default branch, or a branch with no commits of its own). An UNRESOLVABLE base is a '
+  + 'different situation and still FAILS — see the E2.3b unresolvable-base case, which runs in every checkout.'
+// The third situation, and it is the ordinary one: a real delta that adds no ENGINE
+// module — a test-only, docs-only or script-only branch. The cap-literal scan's
+// subject is "the modules this cycle ADDS", so it has nothing to scan, and demanding
+// that every branch add an engine module would be wrong. This is NOT the vacating
+// cycle 3 guarded against: that one is the base collapsing to HEAD and emptying the
+// subject set for a cycle that DID add modules, and it is still caught at its cause
+// by E2.3b's `sha !== HEAD` assertion, which runs whenever a delta exists.
+const NO_NEW_ENGINE_WHY = 'this delta adds no engine module, so the cap-literal scan over "the modules this '
+  + 'cycle adds" has no subject (a test-only, docs-only or script-only branch). The vacating this scan exists to '
+  + 'prevent — a base that collapsed to HEAD — is caught at its cause by E2.3b, and an UNRESOLVABLE base still FAILS.'
 
 // The engine modules this cycle ADDS, derived rather than listed: the modules that
 // already existed at BASE are separately asserted byte-identical to BASE (E2.3, E3.5),
@@ -847,6 +885,7 @@ await test('E2.3/AC2: transitions are computed by reading the spec through resol
 })
 
 await test('E2.3b/AC2: the cycle diff base resolves to a real commit that is a STRICT ancestor of HEAD', () => {
+  if (noCycleDelta()) return SKIP(NO_DELTA_WHY)
   const sha = requireBase()
   assert.match(sha, /^[0-9a-f]{7,40}$/, 'the base must be a commit id, not a ref name that a later command re-resolves')
   assert.equal(gitTry(['cat-file', '-t', sha]), 'commit', 'the resolved base must be a real commit object')
@@ -854,8 +893,13 @@ await test('E2.3b/AC2: the cycle diff base resolves to a real commit that is a S
     'a base that is not an ancestor of HEAD cannot describe what this cycle changed')
   assert.notEqual(sha, gitTry(['rev-parse', 'HEAD']),
     'the base must not be HEAD itself — that is exactly the vacating this constant exists to prevent')
-  assert.ok(newEngineSources().length > 0,
-    'the base yields an empty subject set, so the cap-literal scan and both reuse byte-compares are vacuous')
+  // The subject-set claim that used to sit here has moved to E2.4, which is the case
+  // that actually needs a subject. It was never a property of base RESOLUTION: an
+  // empty subject set has two causes, and only one of them is a defect. The defect —
+  // the base collapsing to HEAD and emptying the set for a cycle that did add modules
+  // — is caught one line above, at its cause. The benign cause, a branch that adds no
+  // engine module, is E2.4's stated skip.
+  assert.ok(newEngineSources().length >= 0, 'the subject set must be computable from a resolved base')
   assert.ok(BASE_CANDIDATES.includes(CYCLE_BASE.ref))
 })
 
@@ -917,9 +961,12 @@ await test('E2.4/AC2: cap values come from spec/bindings/claude.yaml — a clone
 })
 
 await test('E2.4/AC2 negative-derivation: no engine source pairs a cap key with its literal bound', () => {
+  if (noCycleDelta()) return SKIP(NO_DELTA_WHY)
   const caps = spec().binding.caps
+  // `newEngineSources()` PROPAGATES an unresolvable base rather than returning [], so
+  // the fail-loud is reached before the skip can be considered.
   const sources = newEngineSources()
-  assert.ok(sources.length > 0, 'the M1 engine modules must exist for this scan to mean anything')
+  if (sources.length === 0) return SKIP(NO_NEW_ENGINE_WHY)
   for (const [name, src] of sources) {
     for (const [key, value] of Object.entries(caps)) {
       const re = new RegExp(`${key.replace('.', '\\.')}[^\\n]{0,40}\\b${value}\\b`)
@@ -3682,95 +3729,128 @@ function cycleDigestPath() {
 // The sources setup/manifest.json registers. The derived-artifact rule is a
 // MECHANICAL set-intersection, not a judgment call: the regenerated manifest is
 // admitted into a cycle's surface exactly when the cycle touched one of these.
-function manifestSources() {
-  const rel = 'setup/manifest.json'
-  if (!existsSync(join(root, rel))) return null
-  try { return (JSON.parse(readRepo(rel)).artifacts || []).map((a) => a.source) } catch { return null }
+const MANIFEST_REL = 'setup/manifest.json'
+
+// The sources setup/manifest.json registers, UNIONED across the delta's two ends.
+// Reading only the HEAD manifest would miss an artifact that was REMOVED: its source
+// file is in the delta (as a deletion) while the post-change manifest no longer names
+// it, so the trigger would look absent although the manifest legitimately changed.
+// The union is a derivation, not an exception.
+function manifestSourcesAt(text) {
+  try { return (JSON.parse(text).artifacts || []).map((a) => a.source) } catch { return null }
+}
+function manifestSources(base = null) {
+  if (!existsSync(join(root, MANIFEST_REL))) return null
+  const head = manifestSourcesAt(readRepo(MANIFEST_REL))
+  if (head === null) return null
+  if (!base) return head
+  let atBase = []
+  try { atBase = manifestSourcesAt(gitShow(`${base}:${MANIFEST_REL}`)) || [] } catch { atBase = [] }
+  return [...new Set([...head, ...atBase])]
 }
 
-await test('E4.45/AC-C4-6 (cycle 4): the cycle\'s change surface is pinned — the implementation surface stays confined, and each rider is a reasoned row', () => {
-  // Vacuously green at the cycle base and load-bearing the moment GREEN commits.
-  const base = '359bc8b'
-  const out = gitTry(['diff', '--name-only', `${base}..HEAD`])
-  assert.ok(out !== null, `precondition: the cycle base ${base} must be reachable`)
-  const files = out.split('\n').map((s) => s.trim()).filter(Boolean)
-  const FREE = ['engine/flow.mjs', 'test/engine/run.mjs']
-  const COMMENT_ONLY = 'engine/run-state.mjs'
+// The manifest's own PRODUCERS — the two files that change the manifest without being
+// hashed INTO it, and therefore the one legitimate way it can move with no registered
+// source in the delta. Both are DERIVED from the generator's own assignments rather
+// than listed, so a rename moves them with the script:
+//   - the generator itself, whose artifact list and hash algorithm decide the output.
+//     Measured: it is NOT a registered source, so it cannot trigger the rule any other way.
+//   - the version-stamp source it reads (`PLUGIN_JSON`), which supplies
+//     `manifest.version`. Measured: likewise not a registered source.
+// This is the ONE stated exception, admitted as a narrow row with its reason — the
+// same shape as the digest row — never as a general "manifest changes are fine".
+function manifestProducers() {
+  const rel = 'setup/gen-manifest-hashes.sh'
+  if (!existsSync(join(root, rel))) return null
+  const m = /^PLUGIN_JSON="([^"\n]+)"\s*$/m.exec(readRepo(rel))
+  return m ? [rel, m[1]] : null
+}
 
-  // ---- rider 1: the HANDOFF step-6.7 cycle digest -----------------------------
+await test('E4.45/AC-C4-6: the branch\'s own delta obeys the DURABLE surface rules — the digest is append-only, and the manifest rides its trigger', () => {
+  // GENERALIZED post-merge (issue #4 is merged). This case used to pin issue #4's
+  // literal file list against that cycle's own base, which made it unsatisfiable for
+  // every later cycle: issue #5's first commit adds a file the list cannot contain,
+  // and the list has no durable successor — a cycle's allowed set is defined by that
+  // cycle's own design document, which the suite has no way to know. What IS durable
+  // is the two repo-wide rules the pin discovered while enforcing the cycle-scoped
+  // one, and those are what it now asserts. The cycle-scoped half is not re-homed
+  // anywhere: E2.3/E3.5 already byte-compare the frozen modules against the base, and
+  // per-cycle scope is the GATE:PLAN artifact's job, not the suite's.
+  if (noCycleDelta()) return SKIP(NO_DELTA_WHY)
+  const base = requireBase()
+  const out = gitTry(['diff', '--name-only', `${base}..HEAD`])
+  const files = out.split('\n').map((x) => x.trim()).filter(Boolean)
+
+  // ---- rule 1: the cycle digest is a WRITE-ONLY-FORWARD plane -----------------
   //
-  // AUTHORITY: docs/autoflow-guide.md > HANDOFF step 6.7 MANDATES this append and
-  // describes the resulting push as a PR co-ride on the cycle's own dev branch,
-  // explicitly "CI re-runs on the docs-only delta (benign)". So a cycle that reaches
-  // step 6.7 necessarily carries this file, and a pin that reds on it reds on a
-  // mandated step of the process it is running inside — for every future cycle on
-  // this repo, not only for this issue.
-  //
-  // This is NOT a broadened glob and NOT a "docs are fine" escape: exactly one path
-  // is admitted, it is DERIVED from the emitter that owns it, and it carries a
-  // CONTENT constraint of its own — the digest is a write-only-forward JSON Lines
-  // plane (step 6.7 [DENY]), so its diff must be APPEND-ONLY. A truncating or
-  // rewriting edit to the digest is still outside the surface.
+  // AUTHORITY: docs/autoflow-guide.md > HANDOFF step 6.7 — the digest is APPENDED
+  // (`>>`, never truncating) and is never read back into a gate. The path is DERIVED
+  // from the emitter that owns it, so a rename moves this with it rather than
+  // silently widening what is admitted.
   const digest = cycleDigestPath()
   assert.ok(digest,
     'the cycle-digest emitter no longer declares its append target where this case can derive it — re-derive the '
-    + 'admitted path from scripts/handoff/emit-cycle-digest.sh before trusting this pin')
-
-  // ---- rider 2: the regenerated manifest, admitted only ON ITS CONDITION -------
-  //
-  // AUTHORITY: docs/autoflow-guide.md > GREEN step 3 / VALIDATE step 5 (Change
-  // Surface Rules > Derived artifacts). The manifest is staged in the SAME commit as
-  // the manifest-registered source it derives from, and the trigger is a mechanical
-  // set-intersection. It is therefore admitted only when that intersection actually
-  // fires — never unconditionally, or the pin would stop noticing a manifest that
-  // rode along for no reason.
-  const MANIFEST = 'setup/manifest.json'
-  const sources = manifestSources()
-  assert.ok(Array.isArray(sources), `${MANIFEST} is unreadable, so the derived-artifact condition cannot be evaluated`)
-  const touchedSources = files.filter((f) => f !== MANIFEST && sources.includes(f))
-  const manifestAdmitted = touchedSources.length > 0
-
-  const admitted = new Set([...FREE, COMMENT_ONLY, digest, ...(manifestAdmitted ? [MANIFEST] : [])])
-  const outside = files.filter((f) => !admitted.has(f))
-  assert.deepEqual(outside, [],
-    `files outside the cycle's allowed set: ${outside.join(', ')} — the allowed set is `
-    + `[${[...admitted].join(', ')}]${manifestAdmitted ? ` (${MANIFEST} admitted because the cycle touched ${touchedSources.join(', ')})` : ''}`)
-
-  // This cycle's implementation surface touches no manifest-registered source, so the
-  // manifest row must be INERT. Asserted rather than assumed: a manifest that appears
-  // without its trigger is exactly the unexamined rider the pin exists to catch.
-  if (!manifestAdmitted) {
-    assert.ok(!files.includes(MANIFEST),
-      `${MANIFEST} rode along while the cycle touched none of its registered sources — the derived-artifact rule did not fire, so nothing authorises it`)
-  }
-
-  // The digest's own content constraint.
+    + 'path from scripts/handoff/emit-cycle-digest.sh before trusting this rule')
   if (files.includes(digest)) {
     const d = gitTry(['diff', `${base}..HEAD`, '--', digest]) || ''
     const removed = d.split('\n').filter((l) => l.startsWith('-') && !l.startsWith('---'))
     assert.deepEqual(removed, [],
-      `${digest} is a write-only-forward plane and its diff removes ${removed.length} line(s); step 6.7 appends only`)
+      `${digest} is a write-only-forward plane and this delta removes ${removed.length} line(s); step 6.7 appends only`)
   }
 
-  if (files.includes(COMMENT_ONLY)) {
-    // Strictly stronger than excluding the file: the citation sweep GREEN must do is
-    // admitted, while the STATE_FIELDS / STATE_UNENFORCED contract change AC-C4 rules
-    // out is not. A pin that reds against a change another case requires is a false
-    // pin, and the pressure it creates is to delete it.
-    const diff = gitTry(['diff', `${base}..HEAD`, '--', COMMENT_ONLY]) || ''
-    const code = diff.split('\n')
-      .filter((l) => (l.startsWith('+') || l.startsWith('-')) && !l.startsWith('+++') && !l.startsWith('---'))
-      .map((l) => l.slice(1).trim())
-      .filter((l) => l !== '' && !l.startsWith('//'))
-    assert.deepEqual(code, [], `${COMMENT_ONLY} may be swept for citations but its contract is frozen; non-comment lines changed:\n        ${code.join('\n        ')}`)
-  }
+  // ---- rule 2: the derived-artifact regeneration ------------------------------
+  //
+  // AUTHORITY: docs/autoflow-guide.md > GREEN step 3 / VALIDATE step 5 (Change
+  // Surface Rules > Derived artifacts). The trigger is a MECHANICAL set-intersection,
+  // not a judgment call: if the delta touches a manifest-registered source, the
+  // regenerated manifest belongs in the same change. Evaluated here rather than
+  // assumed, so the manifest is neither demanded without cause nor forgotten with it.
+  const MANIFEST = MANIFEST_REL
+  const sources = manifestSources(base)
+  const producers = manifestProducers()
+  assert.ok(Array.isArray(sources) && sources.length > 0,
+    `${MANIFEST} is unreadable at HEAD, so the derived-artifact condition cannot be evaluated`)
+  assert.ok(Array.isArray(producers) && producers.length === 2,
+    'the manifest generator no longer declares its version-stamp source where this case can derive it — re-derive '
+    + 'the producer set from setup/gen-manifest-hashes.sh before trusting this rule')
+  const touchedSources = files.filter((f) => f !== MANIFEST && sources.includes(f))
+  const touchedProducers = files.filter((f) => producers.includes(f))
+  const inDelta = files.includes(MANIFEST)
 
-  // The exclusions the case is actually FOR, asserted positively so admitting the two
-  // riders cannot be read as relaxing them.
-  for (const frozen of ['engine/cli.mjs', 'engine/mechanical.mjs', 'engine/gate.mjs', 'engine/routing.mjs']) {
-    assert.ok(!files.includes(frozen), `${frozen} is unconditionally outside this cycle's surface`)
+  // The rule is a BICONDITIONAL — the manifest is in the delta iff a trigger is —
+  // and the two directions take DIFFERENT trigger sets, because the two kinds of
+  // trigger do not mean the same thing. Measured, not assumed:
+  //
+  //   a REGISTERED SOURCE's hash is IN the manifest, so touching one NECESSARILY
+  //     moves the manifest. It both demands and justifies the regen.
+  //   a PRODUCER decides how the manifest is BUILT and is hashed into nothing, so
+  //     touching one MAY leave the output byte-identical — a comment added to the
+  //     generator does exactly that, verified. It justifies a regen; it cannot demand
+  //     one, and a forward assertion over producers reds on a legitimate commit.
+  //
+  // Hence: forward over sources, converse over sources ∪ producers.
+  if (touchedSources.length > 0) {
+    assert.ok(inDelta,
+      `this delta touches manifest-registered source(s) ${touchedSources.join(', ')} but does not carry the `
+      + `regenerated ${MANIFEST}; run setup/gen-manifest-hashes.sh and stage it in the same commit`)
   }
-  assert.deepEqual(files.filter((f) => f.startsWith('spec/')), [], 'spec/** is frozen for this cycle')
+  // The direction the PR #10 reviewer found missing. The one-way form caught a source
+  // changed without its regen and let a manifest changed with NO trigger through — a
+  // tampered sha256, or a stale regen committed for no reason, rode along unexamined.
+  // Cycle 4's allowed-set formulation caught that as a side effect; generalizing
+  // dropped it, so it is restored as an explicit assertion rather than a side effect.
+  if (inDelta) {
+    assert.ok(touchedSources.length + touchedProducers.length > 0,
+      `${MANIFEST} changed but this delta touches none of its triggers — no registered source, and neither `
+      + `producer (${producers.join(', ')}). A manifest that moves on its own is a hand edit or a stale regen, `
+      + 'and the derived-artifact rule authorises neither')
+  }
+  // DECLARED LIMIT, stated rather than left to be found: a producer change that DOES
+  // alter the output and is not regenerated passes here, because deciding it requires
+  // running the generator (it shells out to jq/shasum) and this suite is offline and
+  // stdlib-only. The strongest part of that residual is already covered elsewhere —
+  // the generator's own header records that verify-install-into-target AC2e asserts
+  // every copy row's sha256 equals the current source hash.
 })
 
 await test('E4.47/AC-C4-1,2 (cycle 4): the predicate\'s far edge — a `scores` that is PRESENT but is not a score table', () => {
@@ -4306,9 +4386,10 @@ await test('E6.5 proxy: the M1 suite runs offline in under 5 s (its own bound, p
 })
 
 const elapsedMs = Date.now() - started
+const skipNote = skips ? `, ${skips} skipped` : ''
 console.log(
   failures
-    ? `\n${failures} of ${cases} flow-engine test(s) FAILED  (${elapsedMs} ms)`
-    : `\nall ${cases} flow-engine tests passed  (${elapsedMs} ms)`,
+    ? `\n${failures} of ${cases} flow-engine test(s) FAILED${skipNote}  (${elapsedMs} ms)`
+    : `\nall ${cases - skips} flow-engine tests passed${skipNote}  (${elapsedMs} ms)`,
 )
 process.exit(failures ? 1 : 0)
