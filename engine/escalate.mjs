@@ -16,6 +16,12 @@ export const EXIT_CODES = { escalate: 2, end: 0, close: 0 }
 const defaultNotify = (record) => process.stderr.write(`${JSON.stringify(record)}\n`)
 
 export function escalate(state, { statePath, persist = saveState, notify = defaultNotify } = {}) {
+  // The middle clause is an embedder-API guard, not a path the shipped
+  // advance()+cli.mjs loop takes (advance()'s RESERVED branch always sets
+  // `terminal` before returning). It protects a direct escalate(state) call
+  // on a state loaded from disk where that branch's write was skipped
+  // (engine/flow.mjs's `advance()` terminal return; see its adjudication note)
+  // — such a document reads `terminal: null` with `step` on a reserved value.
   const terminal = state.terminal || (RESERVED.has(state.step) ? state.step : 'escalate')
   const last = state.history && state.history.length ? state.history[state.history.length - 1] : null
   const reason = state.halt ? state.halt.reason : `the flow reached "${terminal}"`
@@ -30,5 +36,11 @@ export function escalate(state, { statePath, persist = saveState, notify = defau
     statePath,
   })
 
+  // The `??` fallback cannot fire under the current declarations — EXIT_CODES'
+  // key set equals RESERVED (engine/routing.mjs), and `terminal` above is
+  // always one of those keys or the literal 'escalate'. Kept as a guard
+  // against the two constants drifting apart across future edits (they are
+  // declared in separate modules with no shared source), so a divergence
+  // fails safe to the escalate exit code instead of exiting `undefined`.
   return { terminal, reason, exitCode: EXIT_CODES[terminal] ?? EXIT_CODES.escalate }
 }

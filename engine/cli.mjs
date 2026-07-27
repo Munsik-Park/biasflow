@@ -16,6 +16,9 @@ import { NO_EFFECTS } from './mechanical.mjs'
 import { loadSpec } from './spec-load.mjs'
 import { loadState, saveState } from './run-state.mjs'
 
+// Usage guard for a direct human/embedder invocation with a missing argument —
+// not exercised by the test suite (which always supplies a state path), but
+// this is the CLI's only argument, so an omission is a real, expected input.
 const statePath = process.argv[2]
 if (!statePath) {
   process.stderr.write('usage: node engine/cli.mjs <statePath>\n')

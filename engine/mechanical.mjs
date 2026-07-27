@@ -33,6 +33,10 @@ export class StepIncompleteError extends Error {
 function effectOf(effects, step, ctx) {
   const fn = effects ? effects[step] : undefined
   if (typeof fn !== 'function') throw new EffectsNotWiredError(step)
+  // `|| {}` guards a caller-supplied (embedder) effects function that returns
+  // a falsy value — no shipped implementation does, but the handlers below
+  // read properties straight off the result, so a broken embedder wiring
+  // fails as an unmet done-when instead of crashing on `undefined.prop`.
   return fn(ctx) || {}
 }
 
@@ -42,7 +46,9 @@ function effectOf(effects, step, ctx) {
 const SEVERITY_RANK = { low: 1, medium: 2, high: 3, critical: 4 }
 const rank = (s) => SEVERITY_RANK[String(s || '').toLowerCase()] || 0
 
-const present = (v) => (Array.isArray(v) ? v.length > 0 : Boolean(v))
+// Its only caller passes `e.reviewComments`, which is always an array or `null`/
+// `undefined` (the effect-record shape), so a non-array truthy input never occurs.
+const present = (v) => Array.isArray(v) && v.length > 0
 
 export const HANDLERS = Object.freeze({
   // done-when: prior cycles resolved, tree clean, remote synced, branch created

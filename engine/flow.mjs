@@ -193,6 +193,8 @@ export function exhaustionTarget(spec, capKey) {
 
 // ---- the executor --------------------------------------------------------------
 
+// `start` defaults to 'preflight' because every shipped caller supplies it
+// explicitly (an embedder API default, not a path any test exercises).
 export function initialState(spec, { issue, start = 'preflight' } = {}) {
   return {
     version: STATE_VERSION,
@@ -236,7 +238,6 @@ function transitionOn(spec, state, env, stepId, outcome) {
   const capKey = capKeyFor(stepId, outcome)
   const counters = { ...state.counters }
   const spent = counters[capKey] || 0
-  let event
   const entry = { from: stepId, outcome }
   if (capKey && spent >= capValue(spec, capKey)) {
     const ex = exhaustionTarget(spec, capKey)
@@ -244,16 +245,16 @@ function transitionOn(spec, state, env, stepId, outcome) {
     entry.capKey = capKey
     entry.exhausted = true
     entry.resolvedOutcome = ex.outcome
-    event = { kind: 'transition', from: stepId, outcome, to: ex.target, capKey, exhausted: true, resolvedOutcome: ex.outcome }
   } else {
     if (capKey) counters[capKey] = spent + 1
     const { target } = resolve(spec, stepId, outcome)
     entry.to = target
     if (capKey) entry.capKey = capKey
-    event = capKey
-      ? { kind: 'transition', from: stepId, outcome, to: target, capKey }
-      : { kind: 'transition', from: stepId, outcome, to: target }
   }
+  // The persisted history row and the returned event describe the same
+  // transition, so the event is derived from the entry instead of a second
+  // hand-written literal the two could drift apart from.
+  const event = { kind: 'transition', ...entry }
   const next = write(env, {
     ...state,
     counters,
@@ -266,6 +267,11 @@ function transitionOn(spec, state, env, stepId, outcome) {
 }
 
 export function advance(spec, state, env = {}) {
+  // Embedder-API affordance, not a path the shipped CLI/runFlow re-enter: both
+  // break their drive loop on the first non-transition event, so this guard is
+  // for an embedder that calls advance() again on an already-halted document —
+  // without it, re-entry would fall through to the step lookup below and
+  // re-execute (or misroute) a step the flow already stopped on.
   if (state.status === 'halted') {
     const event = state.halt
       ? { kind: 'halt', reason: state.halt.reason, step: state.halt.step, detail: state.halt.detail }
@@ -305,6 +311,14 @@ export function advance(spec, state, env = {}) {
     const output = env.delegationOutput || {}
     outcome = computeVerdict(output.scores, env.thresholds || THRESHOLDS).pass ? 'pass' : 'fail'
   } else {
+    // Same embedder-API guard as the gate branch above (env.delegationOutput
+    // || {}): every shipped delegation is re-entered through the CLI/runFlow,
+    // which always supplies an output, but this step kind is reachable the
+    // same way M21 (the gate branch) turned out to be — a hand-crafted state
+    // document, pending on a non-gate step, driven directly. Left in place
+    // rather than deleted so that path degrades to `outcome: undefined`
+    // (routed to StepIncompleteError/refusal) instead of crashing on a read
+    // of `.outcome` off `undefined`.
     outcome = (env.delegationOutput || {}).outcome
   }
 
