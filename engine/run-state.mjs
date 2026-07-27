@@ -78,7 +78,7 @@ export const STATE_FIELDS = Object.freeze({
     expected: 'null or an object',
     ok: isNullableObject,
     // R1: a delegating resume reads `state.pending.step` and hands it to
-    // `spec.steps.get()` as a key (engine/flow.mjs:288). The type that read requires
+    // `spec.steps.get()` as a key (engine/flow.mjs:303). The type that read requires
     // is a string — so this row, and not a branch about `{}`, is what refuses an
     // empty marker.
     shape: Object.freeze({ step: { expected: 'a string', ok: isString } }),
@@ -93,15 +93,15 @@ export const STATE_FIELDS = Object.freeze({
 // boundary is stated in BOTH directions and an unenforced property is a recorded
 // decision rather than an omission. `*` is any map key, `[]` any array element.
 export const STATE_UNENFORCED = Object.freeze([
-  { path: 'pending.roles', clause: 'R2', reason: 'written by delegateOn (engine/flow.mjs:232) and never read back; a resume takes its delegation payload from env.delegationOutput' },
+  { path: 'pending.roles', clause: 'R2', reason: 'written by delegateOn (engine/flow.mjs:242) and never read back; a resume takes its delegation payload from env.delegationOutput' },
   { path: 'pending.request', clause: 'R2', reason: 'an audit record, not a resume input; enforcing it would pin the loader to buildRequest()\'s output shape, so a request-shape edit would invalidate documents already on disk' },
   { path: 'halt.reason', clause: 'R2', reason: 'copied into the halt event and the notify record; never dereferenced, never used as a key' },
   { path: 'halt.step', clause: 'R2', reason: 'as halt.reason — pass-through into the event and the notify record' },
   { path: 'halt.detail', clause: 'R2', reason: 'as halt.reason — pass-through into the event and the notify record' },
   { path: 'history[].capKey', clause: 'R2', reason: 'read behind a guard in escalate() (engine/escalate.mjs:34) and copied into the notify record; a non-object element yields undefined, not a fault' },
   { path: 'counters.*', clause: 'R3', reason: 'a counter KEY is an opaque string compared against derived cap keys; an undeclared key spends no budget, and which keys are legitimate is the spec\'s question, not the document\'s' },
-  { path: 'counters.*.value', clause: 'R3', reason: 'the MAGNITUDE of a well-typed counter is a value domain, and R3 places the contract\'s boundary at the type preconditions the cap arithmetic needs. A magnitude claim is decidable document-internally — history[] entries carry capKey (engine/flow.mjs:250,257) — so a counters-vs-history consistency check is a CONSTRUCTIBLE option, deliberately out of scope for a type contract and recorded here rather than claimed impossible' },
-  { path: 'step', clause: 'R3', reason: 'spec membership is not a document property; an unresolvable id fails TYPED at the point of use (StepResolutionError, engine/flow.mjs:290)' },
+  { path: 'counters.*.value', clause: 'R3', reason: 'the MAGNITUDE of a well-typed counter is a value domain, and R3 places the contract\'s boundary at the type preconditions the cap arithmetic needs. A magnitude claim is decidable document-internally — history[] entries carry capKey (engine/flow.mjs:260,267) — so a counters-vs-history consistency check is a CONSTRUCTIBLE option, deliberately out of scope for a type contract and recorded here rather than claimed impossible' },
+  { path: 'step', clause: 'R3', reason: 'spec membership is not a document property; an unresolvable id fails TYPED at the point of use (StepResolutionError, engine/flow.mjs:305)' },
   { path: 'pending.step', clause: 'R3', reason: 'as step — the string TYPE is enforced by the shape row above; only spec membership is left open, and it fails typed at the point of use' },
 ])
 
