@@ -5,9 +5,11 @@
 // ============================ State document contract ============================
 //
 // THE READ-BACK RULE. A persisted state document is admitted iff every value the
-// engine will ACT ON after reading it back has the type that action requires. The
-// contract enforces exactly those paths, at exactly that depth, and nothing beyond
-// them. Three clauses decide any shape this file never mentions:
+// engine will ACT ON after reading it back has the type that action requires. The rule
+// is a FLOOR, not an exact set: it fixes the paths that MUST be enforced and the depth
+// at which they must be; the declaration below may sit ABOVE that floor, and where it
+// does, ABOVE THE FLOOR names the rows. Three clauses decide any shape this file never
+// mentions:
 //
 //   R1 — enforce what is ACTED ON. A path is enforced when the engine, on a document
 //        `loadState()` returned, dereferences it further (`state.pending.step`), uses
@@ -35,6 +37,19 @@
 // reason). Both are exported DATA: a new constraint is a ROW, never a branch, and
 // "you did not validate X" is answered by citing a table rather than by patching one
 // more witness. Adding a check for a shape neither table mentions means adding a row.
+//
+// ABOVE THE FLOOR. Three enforced rows are not mandated by R1, because no R1 use reaches
+// them: `status` is only compared (`state.status === 'halted'`, engine/flow.mjs:290),
+// `terminal` is tested for truthiness and then carried (engine/escalate.mjs:25,
+// engine/flow.mjs:293), and `issue` is copied into the notify record
+// (engine/escalate.mjs:31) — all three are R2 pass-throughs by the clause's own words.
+// They are RETAINED, and the reason is not that they are load-bearing. They predate the
+// rule; every document a real run writes already satisfies them; and a row that already
+// refuses can only be removed by WIDENING what the loader admits. Widening is a
+// behaviour change and would retire refusals the suite asserts — keeping a row that
+// costs nothing is neither. R2 says such a path NEED NOT be enforced; it does not say an
+// already-enforced one must be dropped. The floor is a lower bound on this table, so a
+// row above it is a recorded decision, not a contradiction of the rule.
 //
 // The schema is CLOSED at the top level: `load(save(s))` deep-equals `s`, which is
 // what makes the round-trip assertable as a deep-equal rather than a field-by-field
