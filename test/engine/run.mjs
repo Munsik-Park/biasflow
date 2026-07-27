@@ -585,7 +585,15 @@ await test('E6.6/AC6: docs/maintained-docs.md registers the new suite and no lon
 // numbering moved twice in this cycle alone. What is left below is the residue where
 // the claim is about a specific EXPRESSION that no symbol name locates, and each of
 // those carries the token the citing comment says is there.
-const CITED_SOURCES = Object.freeze(['test/engine/run.mjs', 'test/spec/run.mjs'])
+// Widened in cycle 4 (E4.48). The engine's own modules cite each other by line, and
+// cycle 3 swept those by hand — twice. Twice by hand is the argument for mechanising
+// it: the class this cycle inserts at the top of engine/flow.mjs shifts every line
+// those comments name, so the sweep becomes mechanically required rather than
+// remembered.
+const CITED_SOURCES = Object.freeze([
+  'test/engine/run.mjs', 'test/spec/run.mjs',
+  ...engineSources().map(([f]) => `engine/${f}`),
+])
 
 // AUTHORED, in the PROSE_SOURCED shape: the token is what the citing comment CLAIMS is
 // at that line. It is never read back out of the engine to build the expectation —
@@ -600,7 +608,27 @@ const LINE_ANCHOR_TOKENS = Object.freeze({
   'routing.mjs:75': 'declares no outcome',
   'cli.mjs:29': 'NO_EFFECTS',
   'lint.mjs:6': 'Findings are reported, never',
+  // Cycle 4 (E4.48): the engine-side citations, derived by running the widened scan
+  // and registering exactly the keys it returned — not transcribed from a count.
+  'escalate.mjs:25': 'const terminal = state.terminal',
+  'escalate.mjs:31': 'issue: state.issue,',
+  'escalate.mjs:34': 'last.capKey',
+  'flow.mjs:242': 'function delegateOn(',
+  'flow.mjs:260': 'entry.capKey = capKey',
+  'flow.mjs:290': "state.status === 'halted'",
+  'flow.mjs:293': "kind: 'terminal'",
+  'flow.mjs:305': 'throw new StepResolutionError(stepId)',
+  'routing.mjs:31': "'handoff:env-failure'",
 })
+
+// A DECLARED limit of the guard, recorded rather than carried silently. CITATION_RE
+// requires the `engine/` prefix on every match, so a citation naming two lines in one
+// reference (`engine/<f>.mjs:260,267`) registers its FIRST anchor only; the second is
+// scanned by nothing and can drift undetected. The disposition taken is to rewrite
+// such a citation into two prefixed references rather than to widen the regex for one
+// site — a comment-only edit. Until that is done the second line is unguarded, and
+// this note is where the next author is told so. Splitting a citation ADDS a row here;
+// the `unregistered` assertion below reports the exact key to add.
 
 // The symbols this suite cites BY NAME rather than by line. Each must still be defined
 // in the module named — which is the whole point: no line shift can break it.
@@ -3023,6 +3051,801 @@ await test('E4.34/AC-C3-1 (cycle 3): the write side mirrors the VERSION check to
 
 
 // ================================================================================
+// GROUP 4 (cycle 4) — the ABSENCE RULE at the engine's runtime input boundary
+// ================================================================================
+//
+// Authored from .autoflow/issue-4-verification-design.md (cycle 4) §1/§3/§4 and the
+// acceptance criterion .autoflow/issue-4-c4-acceptance-criterion.md, before the
+// implementation. Cycles 2 and 3 constrained the persisted DOCUMENT at loadState().
+// This is a different boundary: a value the CALLER supplies at run time, on a
+// different module, and the read-back rule does not reach it.
+//
+// The finding: a gate resumed with no `env.delegationOutput` takes
+// `env.delegationOutput || {}` and computes a verdict from the coerced `{}` — so an
+// evaluation that never ran persists a `fail` transition and spends a retry.
+// `computeVerdict(undefined).reason` is already `'evaluation not run'`; the engine
+// holds the distinction and the coercion discards it. Measured on all FOUR gate
+// steps, not on the reviewer's one, so every case below derives its gate set from
+// `spec.steps` rather than naming `gate_plan`.
+//
+// The rule this cycle ships (feature design §1, verification design §1), transcribed
+// so a reader of the suite meets the criterion beside the cases that enforce it:
+//
+//   THE ABSENCE RULE. At the engine's runtime input boundary an absent
+//   caller-supplied value may be DEFAULTED (a declared constant or port), BRANCHED ON
+//   (a distinct declared state), left OPAQUE (handed to a port the engine never
+//   interprets it for), or REFUSED (a typed error raised where the absence is
+//   detected). It may never be COERCED into a value shaped like a present one.
+//
+// Its test is mechanical, and it is the reason this cycle produces a classifier
+// rather than a patch: drive the engine TWICE on the same document — key absent, key
+// supplied — and project each result onto the closed four-element CONSEQUENTIAL set
+// (a `history` append, a `counters` increment, a `step` change, loss of a `pending`
+// record). The coercion is admissible iff the absent run lands in exactly one of
+// b-i / b-ii / b-iii and the row DECLARES which. Anything else refuses.
+//
+// The unchanged rows are asserted as hard as the two that change (E4.40, E4.41,
+// E4.52, E4.53): the rule's value is that it decides EVERY boundary row. E4.40 is
+// this cycle's over-refusal guard — a `default` / `branch` / `opaque` row that
+// silently became a refusal loses its declared bucket and reds there.
+//
+// Oracle discipline, unchanged from cycles 2-3: the declaration supplies inputs and
+// names the partition under test, never an expectation. No case reads the refusal
+// predicate it tests, no case reads a fixture's own verdict field, the gate set and
+// every cap key and edge target are DERIVED from the loaded spec, and the refusal's
+// message text is PROSE_SOURCED into E4.42 alone.
+
+// ---- the consequential projection (verification §4 item 2) ---------------------
+//
+// ONE definition, so "no consequential persistence" cannot drift between cases. The
+// four elements are derived from what a budget and a resume depend on, not chosen:
+// (i) history append, (ii) counters increment, (iii) step change, (iv) pending loss.
+const consequential = (doc) => ({
+  historyLen: doc && Array.isArray(doc.history) ? doc.history.length : null,
+  counters: doc ? doc.counters : null,
+  step: doc ? doc.step : null,
+  pendingStep: doc && doc.pending ? doc.pending.step : null,
+})
+const sameProjection = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+
+// The derived step sets. Never a literal list of four ids — a fifth gate step added
+// to spec/** is covered without a test edit, which is the property a fix scoped to
+// the reviewer's witness step would not have.
+const gateStepsOf = (sp) => stepIds(sp).filter((id) => stepOf(sp, id).kind === 'gate')
+const delegatedNonGateOf = (sp) => stepIds(sp).filter((id) => {
+  const k = stepOf(sp, id).kind
+  return k !== 'gate' && k !== 'mechanical'
+})
+
+// A loader-valid nine-key document pending on `id` — the shape a real run persists at
+// delegateOn, so the absent-output resume under test is the shipped resume path.
+const pendingDoc = (sp, id, extra = {}) => ({
+  ...goodDoc(),
+  step: id,
+  status: 'delegating',
+  pending: { step: id, roles: rolesOf(stepOf(sp, id)), request: { step: id } },
+  ...extra,
+})
+
+// A legitimate control value for the document's pending step, DERIVED: a gate takes a
+// score table, any other delegated step takes an outcome the step's own declaration
+// carries. Authoring a control per step would make the control a second expectation.
+function controlOutputFor(sp, doc) {
+  const id = doc.pending ? doc.pending.step : doc.step
+  if (!mhas(sp.steps, id)) return { outcome: 'unresolvable' }
+  const st = stepOf(sp, id)
+  return st.kind === 'gate' ? { scores: PASSING_SCORES } : { outcome: mkeys(st.next).sort()[0] }
+}
+
+// ---- absentEnv (verification §4 item 1) ----------------------------------------
+//
+// One advance() over a caller-supplied document with exactly ONE `env` key deleted.
+// The env is otherwise FULLY wired, so the deletion is the only variable. That is not
+// a convenience: cycle 3 lost three measurements to harness artefacts (a driver whose
+// oracle short-circuited, a helper that threw before advance() ran), and a partially
+// wired env would classify the harness and report it as the document's consequence.
+function absentEnv(sp, doc, key, overrides = {}) {
+  const writes = []
+  const before = JSON.parse(JSON.stringify(doc))
+  const effects = {}
+  for (const id of mechanicalIds(sp)) effects[id] = () => EFFECT_FOR[id]('ready')
+  const env = {
+    artifacts: artifactsMap(sp),
+    delegationOutput: controlOutputFor(sp, doc),
+    effects,
+    persist: (p, s) => { writes.push(s) },
+    statePath: SCRATCH_STATE,
+    thresholds: GATE.THRESHOLDS,
+    ...overrides,
+  }
+  if (key !== null) delete env[key]
+  let event = null
+  let err = null
+  let after = doc
+  try {
+    const r = FLOW.advance(sp, doc, env)
+    event = r.event
+    after = r.state
+  } catch (e) { err = e }
+  return { event, err, writes, before, after, env }
+}
+
+// ---- the engine's error vocabulary, DERIVED (verification §4 item 3b, round 10) --
+//
+// Every exported Error subclass of every engine module, minus the process-terminating
+// entries E5.3(a) already derives (importing engine/cli.mjs would exit the runner —
+// measured). Derived per run, so a class added or renamed at GREEN moves the set
+// without a test edit. `TypeError` is deliberately NOT a member: that is what
+// separates b-ii's typed stop from b-iii's port-owned one.
+const EXIT_HOLDERS = engineSources().filter(([, src]) => /process\.exit\s*\(/.test(src)).map(([f]) => f)
+const ENGINE_ERROR_NAMES = new Set()
+for (const [file] of engineSources()) {
+  if (EXIT_HOLDERS.includes(file)) continue
+  const mod = await loadEngine(file)
+  for (const v of Object.values(mod)) {
+    if (typeof v === 'function' && v.prototype instanceof Error) ENGINE_ERROR_NAMES.add(v.name)
+  }
+}
+const inEngineVocabulary = (err) => !!err && ENGINE_ERROR_NAMES.has(err.constructor.name)
+
+// The event kinds advance() declares. Derived from the events the suite's own drivers
+// already observe rather than authored as a fourth list.
+const DECLARED_EVENT_KINDS = Object.freeze(['transition', 'delegate', 'halt', 'terminal'])
+
+// ---- absentVsControl (verification §4 item 3b) ---------------------------------
+//
+// The ONE place the three buckets are defined, so no row can quietly compare against
+// the wrong baseline and a caller must assert the DECLARED bucket rather than "not
+// null". Order is total and is the round-10 one:
+//   (1) matches the control                                   -> b-i
+//   (2) matches the input AND stops in a declared way          -> b-ii
+//   (3) row is `opaque`, matches the input, typed stop OUTSIDE
+//       the engine vocabulary (i.e. inside the port)           -> b-iii
+//   (4) otherwise                                              -> null
+//
+// D1' (GATE:PLAN cycle 4). Both design documents and the shipped INPUT_BOUNDARY
+// header state b-ii's typed-stop sub-case as a typed error "naming the missing
+// input". MEASURED, that clause is false on BOTH rows that take the sub-case:
+// EffectsNotWiredError names the STEP and MissingSlotError names the SLOT and its
+// declared SOURCE — neither names `effects` or `artifacts`. Promoting the naming
+// clause to a conjunct would therefore refuse two rows the rule admits. The
+// resolution taken here is to NARROW the applied rule to what is actually decided —
+// `inEngineVocabulary` alone — and to make the narrowing checkable rather than
+// hoped for: `namesInput` is returned as a per-row OBSERVATION, E4.40 pins its
+// measured value on the two typed-stop rows so a later message change forces a
+// deliberate decision, and E4.46 demonstrates that promoting it to a conjunct kills
+// both rows. The two halves must not be left disagreeing; that was F1's defect class.
+function absentVsControl(sp, doc, key, row, overrides = {}) {
+  const absent = absentEnv(sp, JSON.parse(JSON.stringify(doc)), key, overrides)
+  const control = absentEnv(sp, JSON.parse(JSON.stringify(doc)), null, overrides)
+  const input = consequential(doc)
+  const matchesControl = sameProjection(consequential(absent.after), consequential(control.after))
+  const matchesInput = sameProjection(consequential(absent.after), input)
+  const stop = absent.err
+    ? { kind: 'throw', name: absent.err.constructor.name, code: absent.err.code }
+    : { kind: 'event', event: absent.event && absent.event.kind }
+  const head = String((row && row.input) || key).split('.')[0]
+  const namesInput = !!(absent.err && typeof absent.err.message === 'string' && absent.err.message.includes(head))
+  const declaredEvent = stop.kind === 'event' && DECLARED_EVENT_KINDS.includes(stop.event)
+  const typedEngine = stop.kind === 'throw' && !!stop.code && inEngineVocabulary(absent.err)
+  const typedAtAll = stop.kind === 'throw' && !!stop.code
+  let bucket = null
+  if (matchesControl) bucket = 'b-i'
+  else if (matchesInput && (declaredEvent || typedEngine)) bucket = 'b-ii'
+  else if (row && row.disposition === 'opaque' && matchesInput && typedAtAll && !typedEngine) bucket = 'b-iii'
+  return { absent, control, matchesControl, matchesInput, stop, namesInput, bucket }
+}
+
+// ---- extractEnvReads (verification §4 item 3) ----------------------------------
+//
+// A pure function of source text, so E4.46 can mutate its input without editing
+// engine/**. BOTH exclusions are load-bearing and both are measured: raw, the scan
+// counts `env.delegationOutput` inside a COMMENT in flow.mjs, and — if widened past
+// flow.mjs — inside a STATE_UNENFORCED `reason` STRING in run-state.mjs. A totality
+// case that reds when a comment is edited teaches the next author to weaken it, which
+// is the failure mode this case exists to prevent.
+function stripNonCode(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .split('\n')
+    .map((line) => line.replace(/\/\/.*$/, ''))
+    .join('\n')
+    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
+    .replace(/`(?:[^`\\]|\\.)*`/g, '``')
+}
+function extractEnvReads(src) {
+  const out = []
+  stripNonCode(src).split('\n').forEach((line, i) => {
+    for (const m of line.matchAll(/\benv\.([A-Za-z_]\w*)/g)) out.push({ key: m[1], line: i + 1 })
+  })
+  return out
+}
+
+// The four dispositions the rule defines, authored from feature design §1's table.
+// PROSE_SOURCED: read off the shipped data this would be the table asserting itself.
+const DISPOSITIONS = Object.freeze(['branch', 'default', 'opaque', 'refuse'])
+
+const boundaryRows = () => (Array.isArray(FLOW.INPUT_BOUNDARY) ? FLOW.INPUT_BOUNDARY : [])
+// The two rows this cycle CREATES. Their behaviour is owned by E4.35/E4.36/E4.38, so
+// E4.40 drives every other row — including the `refuse` rows that PRE-DATE the fix,
+// because a typed-stop row whose stop is never measured is a declaration resting on a
+// comment.
+const CREATED_ROWS = Object.freeze(['delegationOutput.scores', 'delegationOutput.outcome'])
+
+await test('E4.35/AC-C4-1,3 (cycle 4): a gate resumed WITHOUT a delegation output refuses TYPED — on every gate step the declaration carries', () => {
+  const sp = spec()
+  const gates = gateStepsOf(sp)
+  assert.ok(gates.length > 1, `precondition: the gate set must be derived and plural, got [${gates.join(', ')}]`)
+  for (const id of gates) {
+    const r = absentEnv(sp, pendingDoc(sp, id), 'delegationOutput')
+    assert.ok(r.err,
+      `${id}: no output was supplied and the engine still produced ${r.event && r.event.kind} `
+      + `${r.event && r.event.outcome ? `"${r.event.outcome}"` : ''} — a verdict was fabricated for an evaluation that never ran `
+      + `(computeVerdict's own reason for this input is "evaluation not run")`)
+    assert.ok(typeof FLOW.DelegationOutputMissingError === 'function',
+      `${id}: engine/flow.mjs exports no typed class for a missing delegated input, so the stop is ${r.err.name}`)
+    assert.ok(r.err instanceof FLOW.DelegationOutputMissingError, `${id}: the stop is ${r.err.name}, not the typed refusal`)
+    assert.equal(r.err.code, 'delegation-output-missing', `${id}: the refusal must carry a stable machine-readable code`)
+    assert.equal(r.err.step, id, `${id}: the refusal must name the step it was raised for`)
+    assert.equal(r.err.kind, 'gate', `${id}: the refusal must carry the step's declared kind, so a caller can switch on it`)
+    assert.equal(r.err.field, 'scores', `${id}: the refusal must name WHICH half of the delegated result was absent`)
+  }
+})
+
+await test('E4.36/AC-C4-2 (cycle 4): the refusal writes NOTHING — no history row, no counter, no step change, no pending loss', () => {
+  const sp = spec()
+  for (const id of gateStepsOf(sp)) {
+    const capKey = (RT.CAP_EDGES[`${id}:fail`] || {}).capKey
+    assert.ok(capKey, `precondition: ${id}'s fail edge must own a cap key, or this case cannot witness a spent budget`)
+    // Seeded, so a spend is visible as a CHANGE rather than as a bare 1.
+    const doc = pendingDoc(sp, id, { counters: { [capKey]: 1 }, history: [{ from: 'dispatch', outcome: 'assigned', to: id }] })
+    const before = consequential(doc)
+    const r = absentEnv(sp, doc, 'delegationOutput')
+    assert.deepEqual(r.writes, [],
+      `${id}: the absent-output resume persisted ${r.writes.length} document(s) — the last one leaves `
+      + `${JSON.stringify(consequential(r.writes[r.writes.length - 1]))} where the input was ${JSON.stringify(before)}; `
+      + 'a retry burned by a non-event is indistinguishable afterwards from one burned by a real failure')
+    assert.deepEqual(consequential(r.after), before, `${id}: the resume advanced the run`)
+    assert.deepEqual(r.before, doc, `${id}: the caller's own document was mutated in place`)
+  }
+})
+
+await test('E4.37/AC-C4-1 (cycle 4): { scores: {} } is NOT absence — an empty evaluation still fails CLOSED on the declared edge', () => {
+  const sp = spec()
+  // GREEN-BEFORE, deliberately (verification §8 clause 3): this is the boundary
+  // AC-C4 point 5 protects and the single most likely casualty of the fix. Its value
+  // is not that it reds at GREEN but that it reds the day the predicate is widened
+  // past absence — the discriminant is "did the adapter supply a score table?", never
+  // "is the table useful?". computeVerdict owns the second question.
+  for (const id of gateStepsOf(sp)) {
+    const capKey = (RT.CAP_EDGES[`${id}:fail`] || {}).capKey
+    const r = absentEnv(sp, pendingDoc(sp, id), null, { delegationOutput: { scores: {} } })
+    assert.ok(!r.err, `${id}: an empty score table was refused — { scores: {} } is a PRESENT evaluation: ${r.err && r.err.message}`)
+    assert.equal(r.event.kind, 'transition', `${id}: an empty evaluation must still route`)
+    assert.equal(r.event.outcome, 'fail', `${id}: an empty evaluation must fail CLOSED`)
+    assert.equal(r.event.to, mget(stepOf(sp, id).next, 'fail'), `${id}: it must route to the DECLARED fail target`)
+    assert.equal(r.after.counters[capKey], 1, `${id}: a real fail spends exactly one ${capKey}`)
+  }
+})
+
+await test('E4.38/AC-C4-4 (cycle 4): the SIBLING branch is decided by the same rule — same class, different field', () => {
+  const sp = spec()
+  const steps = delegatedNonGateOf(sp)
+  assert.ok(steps.length > 1, `precondition: the delegated non-gate set must be derived and plural, got ${steps.length}`)
+  for (const id of steps) {
+    for (const [why, output] of [['absent', undefined], ['{}', {}]]) {
+      const doc = pendingDoc(sp, id)
+      const r = output === undefined
+        ? absentEnv(sp, doc, 'delegationOutput')
+        : absentEnv(sp, doc, null, { delegationOutput: output })
+      // The no-write half is a PRE-EXISTING guarantee this cycle must not lose while
+      // re-routing the branch, so it is asserted alongside the class rather than
+      // assumed. It is green before the change; the class half is not.
+      assert.deepEqual(r.writes, [], `${id} (${why}): the sibling branch persisted a document`)
+      assert.ok(r.err, `${id} (${why}): the resume did not stop at all`)
+      assert.ok(typeof FLOW.DelegationOutputMissingError === 'function',
+        `${id} (${why}): the sibling escapes as ${r.err.name}: ${r.err.message} — untyped, one module below the read, `
+        + 'indistinguishable from a spec defect')
+      // Asserted by IDENTITY against the same constructor, not by two literals: "one
+      // rule, both branches" is the half of AC-C4 point 4 a second error class breaks.
+      assert.ok(r.err instanceof FLOW.DelegationOutputMissingError, `${id} (${why}): the sibling refuses with ${r.err.name}, a different class`)
+      assert.equal(r.err.code, 'delegation-output-missing', `${id} (${why}): the two branches must share one code`)
+      assert.equal(r.err.field, 'outcome', `${id} (${why}): the sibling's missing half is the outcome`)
+      assert.notEqual(r.err.field, 'scores', `${id} (${why}): the field must DISCRIMINATE the two branches, not be a constant`)
+    }
+  }
+})
+
+await test('E4.39/AC-C4-OQ (cycle 4): the input boundary is DECLARED, TOTAL, and the rule is stated where it is read', () => {
+  assert.ok(Array.isArray(FLOW.INPUT_BOUNDARY),
+    'engine/flow.mjs exports no INPUT_BOUNDARY — the open question is answered in prose, and a comment is not enumerable: '
+    + 'a seventh env. read added later cannot fail a comment')
+  assert.ok(Object.isFrozen(FLOW.INPUT_BOUNDARY), 'the declaration must be frozen data')
+  const rows = boundaryRows()
+
+  const reads = extractEnvReads(engineSrc('flow.mjs'))
+  const keys = [...new Set(reads.map((r) => r.key))].sort()
+  const lines = [...new Set(reads.map((r) => r.line))]
+  // Three counts, each with its own diagnosis, because the noun is ambiguous: one
+  // line hosts two reads. A pin that cannot say which unit it counts hides a miscount.
+  assert.equal(keys.length, 6, `the env key set moved: [${keys.join(', ')}]`)
+  assert.equal(reads.length, 9, `the number of comment-stripped env. read occurrences moved: ${reads.length}`)
+  assert.equal(lines.length, 8, `the number of distinct env.-reading lines moved: ${lines.length}`)
+
+  // Totality, one-way: every read has a row. Compared on the row's TOP-LEVEL input,
+  // since three rows are keyed by sub-field. A retained row is never forbidden — the
+  // converse would forbid keying the table by read site, which the two `artifacts`
+  // rows require.
+  const covered = new Set(rows.map((r) => String(r.input).split('.')[0]))
+  const uncovered = keys.filter((k) => !covered.has(k))
+  assert.deepEqual(uncovered, [], `env reads the boundary declaration records no decision about: ${uncovered.join(', ')}`)
+
+  const bad = []
+  const exported = new Set([...Object.keys(FLOW), ...Object.keys(MECH)])
+  for (const row of rows) {
+    if (!DISPOSITIONS.includes(row.disposition)) bad.push(`${row.input}@${row.site}: disposition ${JSON.stringify(row.disposition)} is outside the rule's four`)
+    if (typeof row.reason !== 'string' || row.reason.trim() === '') bad.push(`${row.input}@${row.site}: empty reason`)
+    if (typeof row.site !== 'string' || row.site.trim() === '') bad.push(`${row.input}@?: no read site`)
+    if (row.disposition === 'refuse') {
+      // Resolved against the module's real exports, not by a string compare, so a row
+      // naming a class nobody ships fails here.
+      const named = [...exported].filter((n) => /Error$/.test(n) && row.reason.includes(n))
+      if (named.length === 0) bad.push(`${row.input}@${row.site}: a refuse row must name a class the engine EXPORTS; its reason names none of [${[...exported].filter((n) => /Error$/.test(n)).join(', ')}]`)
+    }
+  }
+  assert.deepEqual(bad, [], `boundary rows that do not carry a usable decision:\n        ${bad.join('\n        ')}`)
+
+  // DCR-10: one predicate, three carriers. A reviewer reads the rule from the shipped
+  // header, not from the suite, and a reach-based paraphrase reaches the OPPOSITE
+  // verdict on `thresholds` and `persist` from the one the suite enforces.
+  const src = engineSrc('flow.mjs')
+  for (const token of ['b-i', 'b-ii', 'b-iii', 'consequential', 'engine vocabulary', ...DISPOSITIONS]) {
+    assert.ok(src.includes(token), `the shipped INPUT_BOUNDARY header does not state ${JSON.stringify(token)} — the rule a reviewer reads is not the rule the suite applies`)
+  }
+})
+
+// The per-row driving table for E4.40. Each entry names the document, the key to
+// delete and the bucket the ROW must declare — never the bucket the run happens to
+// produce. Authored here rather than read off the declaration: the row supplies the
+// subject, this table supplies the expectation.
+function boundaryDrivings(sp) {
+  const delegated = delegatedNonGateOf(sp)[0]
+  const gate = gateStepsOf(sp)[0]
+  const mech = mechanicalIds(sp)[0]
+  return [
+    { input: 'artifacts', site: 'advance:buildRequest', key: 'artifacts', bucket: 'b-ii',
+      doc: { ...goodDoc(), step: delegated }, overrides: {} },
+    { input: 'artifacts', site: 'advance:mechanical-ctx', key: 'artifacts', bucket: 'b-i',
+      doc: { ...goodDoc(), step: mech }, overrides: {} },
+    { input: 'effects', site: 'mechanical:effectOf', key: 'effects', bucket: 'b-ii',
+      doc: { ...goodDoc(), step: mech }, overrides: {} },
+    { input: 'thresholds', site: 'advance:gate-resume', key: 'thresholds', bucket: 'b-i',
+      doc: pendingDoc(sp, gate), overrides: { delegationOutput: { scores: FAILING_SCORES } } },
+    { input: 'persist', site: 'write', key: 'persist', bucket: 'b-i',
+      doc: { ...goodDoc(), step: mech }, overrides: { statePath: join(tmpRoot(), 'persist-row.json') } },
+  ]
+}
+
+await test('E4.40/AC-C4-OQ (cycle 4): the classifier — every declared row\'s admissibility is MEASURED, and this is the over-refusal guard', () => {
+  const sp = spec()
+  const rows = boundaryRows()
+  assert.ok(rows.length > 5, 'precondition: the declaration must exist before its rows can be classified')
+
+  // Every row except the two THIS CYCLE CREATES is driven. The discriminant is not
+  // the `disposition` label but whether the behaviour is new: the pre-existing
+  // `refuse` rows are driven here because a typed-stop row whose stop is never
+  // measured is a declaration resting on a comment — the exact failure E4.39/E4.40
+  // exist to prevent.
+  const drivings = boundaryDrivings(sp)
+  const byKey = (r) => `${r.input}@${r.site}`
+  const declaredRows = new Map(rows.map((r) => [byKey(r), r]))
+  const failures = []
+  for (const d of drivings) {
+    const row = declaredRows.get(byKey(d))
+    if (!row) { failures.push(`${byKey(d)}: the declaration carries no such row, so its admissibility is unmeasured`); continue }
+    const v = absentVsControl(sp, d.doc, d.key, row, d.overrides)
+    if (v.bucket !== d.bucket) {
+      failures.push(`${byKey(d)}: measured bucket ${JSON.stringify(v.bucket)}, expected ${d.bucket} `
+        + `(matchesControl=${v.matchesControl} matchesInput=${v.matchesInput} stop=${JSON.stringify(v.stop)})`)
+      continue
+    }
+    // The row must DECLARE the bucket it measures. "Either one" would let a row that
+    // quietly stopped being immaterial pass as one that never advances — the silent
+    // migration the three-bucket split exists to catch. And a `default`/`branch`/
+    // `opaque` row that became a refusal loses its bucket here: THIS is the
+    // over-refusal guard, on the boundary rather than on the corpus.
+    if (!row.reason.includes(d.bucket)) {
+      failures.push(`${byKey(d)}: measures ${d.bucket} but its reason declares no bucket by that name`)
+    }
+    if (row.disposition === 'refuse' && v.stop.kind !== 'throw') {
+      failures.push(`${byKey(d)}: declared refuse but the absent run stopped with ${JSON.stringify(v.stop)}`)
+    }
+  }
+  assert.deepEqual(failures, [], `rows whose declared admissibility is contradicted by measurement:\n        ${failures.join('\n        ')}`)
+
+  // D1' (GATE:PLAN cycle 4). The stated rule says b-ii's typed stop NAMES the missing
+  // input; the applied rule decides it by the engine vocabulary alone. Measured, the
+  // naming clause is FALSE on both rows that take the sub-case — EffectsNotWiredError
+  // names the step, MissingSlotError names the slot and its declared source. The
+  // divergence is recorded here as a live observation rather than left to disagree:
+  // if a later message change makes naming true, this reds and the decision to
+  // promote the clause to a conjunct (in all three carriers) is taken deliberately
+  // instead of drifting. E4.46 demonstrates what promoting it would cost today.
+  const observed = []
+  for (const d of drivings.filter((x) => x.bucket === 'b-ii')) {
+    const v = absentVsControl(sp, d.doc, d.key, declaredRows.get(byKey(d)), d.overrides)
+    observed.push(`${byKey(d)} namesInput=${v.namesInput} via ${v.stop.name}`)
+    assert.ok(inEngineVocabulary(v.absent.err), `${byKey(d)}: the typed stop must be in the engine's own vocabulary`)
+  }
+  assert.deepEqual(observed.map((s) => s.replace(/ via .*/, '')),
+    ['artifacts@advance:buildRequest namesInput=false', 'effects@mechanical:effectOf namesInput=false'],
+    'the measured naming behaviour of the typed-stop rows moved — the rule\'s wording and the rule the helper applies '
+    + 'must be reconciled deliberately, in all three carriers, not by editing one of them')
+
+  // The two rows that CANNOT be driven here, each with the reason and the owner named.
+  const mech = declaredRows.get('delegationOutput@advance:mechanical-re-entry')
+  assert.ok(mech, 'the mechanical re-entry row must be declared; E4.41 drives it over the handler\'s full record domain')
+  const sp2 = declaredRows.get('statePath@write')
+  assert.ok(sp2, 'the statePath row must be declared')
+  assert.equal(sp2.disposition, 'opaque', 'only an opaque row may reach b-iii')
+  // b-iii's admission is CONDITIONAL, so this row carries a second assertion the
+  // others do not: the measured port-level consequence must be stated on the row.
+  // Substrings that survive rephrasing, never the byte count — it varies with the
+  // driving document. The measurement itself is E4.53's, in a sandboxed child.
+  for (const token of ['b-iii', 'undefined.tmp', 'E4.53']) {
+    assert.ok(String(sp2.reason).includes(token),
+      `the statePath row must state its measured port-level consequence (${JSON.stringify(token)}) — without it b-iii `
+      + 'degrades to a row admitted on a stated ground with nothing checking the ground')
+  }
+})
+
+await test('E4.41/AC-C4-4 (cycle 4): the mechanical exception, measured over the handler\'s FULL record domain', () => {
+  const sp = spec()
+  // The record classes are DERIVED from the handoff handler's ordered checks
+  // (engine/mechanical.mjs > handoff: envFailure, then ciGreen, then
+  // present(reviewComments), then rank(max_severity), then reviewBlockPresent), not
+  // enumerated from a list. A battery driven only on the record that confirms the
+  // claim cannot fail when the claim is wrong — which is what happened to the
+  // round-1 justification of this row.
+  const base = { ciGreen: true, prOpen: true, reviewComments: null, reviewBlockPresent: false, envFailure: false }
+  const pairs = [
+    ['G1 ciGreen', { ...base }, { max_severity: 'Low' }, 'b-i'],
+    ['G2 !ciGreen', { ...base, ciGreen: false }, { max_severity: 'Low' }, 'b-i'],
+    ['G3 envFailure', { ...base, envFailure: true }, { max_severity: 'Low' }, 'b-i'],
+    ['G4 degenerate {}', {}, { max_severity: 'Low' }, 'b-i'],
+    ['G5 reviewComments + Low', { ...base, reviewComments: ['x'] }, { max_severity: 'Low' }, 'b-ii'],
+    ['G6 reviewComments + Low + block', { ...base, reviewComments: ['x'], reviewBlockPresent: true }, { max_severity: 'Low' }, 'b-ii'],
+    ['G7 reviewComments + Medium', { ...base, reviewComments: ['x'] }, { max_severity: 'Medium' }, 'b-ii'],
+  ]
+  const row = boundaryRows().find((r) => r.site === 'advance:mechanical-re-entry')
+  const doc = pendingDoc(sp, 'handoff')
+  const failures = []
+  let diverged = 0
+  let spentByAbsent = 0
+  for (const [why, record, control, wanted] of pairs) {
+    const overrides = { effects: { handoff: () => record }, delegationOutput: control }
+    const v = absentVsControl(sp, doc, 'delegationOutput', row, overrides)
+    if (v.bucket !== wanted) {
+      failures.push(`${why}: measured ${JSON.stringify(v.bucket)}, expected ${wanted} `
+        + `(matchesControl=${v.matchesControl} matchesInput=${v.matchesInput} stop=${JSON.stringify(v.stop)})`)
+      continue
+    }
+    if (wanted === 'b-i') {
+      // Asserted POSITIVELY: these records DO transition, and one of them spends a
+      // cap with the input absent. A case that asserted "this branch never advances"
+      // would red the day someone read the row that way — and the row's round-1
+      // justification said exactly that.
+      if (v.absent.event.kind !== v.control.event.kind) failures.push(`${why}: event kinds diverge (${v.absent.event.kind} vs ${v.control.event.kind})`)
+      if (Object.keys(v.absent.after.counters || {}).length > 0) spentByAbsent++
+    } else {
+      if (!v.absent.event || v.absent.event.kind !== 'delegate') failures.push(`${why}: the absent run must stop by RE-REQUESTING, got ${v.absent.event && v.absent.event.kind}`)
+      if (!sameProjection(consequential(v.control.after), consequential(doc)) || v.control.err) diverged++
+    }
+  }
+  assert.deepEqual(failures, [], `mechanical records whose measured bucket contradicts the declaration:\n        ${failures.join('\n        ')}`)
+  assert.ok(spentByAbsent > 0, 'no b-i record spent a budget with the input absent — the battery has lost the record that refutes "the absence never reaches a write"')
+  assert.equal(diverged, 3, 'every reviewComments-present control must DIVERGE from the absent run, or the case witnesses inertia rather than a declared branch')
+  // The declaration half. Substrings that survive rephrasing, never the numeral: the
+  // shipped reason states a RECORD count and this battery runs (record, control)
+  // PAIRS, and pinning either integer would red on the other's phrasing.
+  assert.ok(row, 'the mechanical re-entry row is not declared at all')
+  assert.equal(row.disposition, 'branch', 'the row is decided BY the rule, not exempted from it')
+  for (const token of ['b-i', 'b-ii', 'mechanical.mjs']) {
+    assert.ok(String(row.reason).includes(token),
+      `the branch row's reason must name the two-bucket split and its derivation (${JSON.stringify(token)}), or the justification `
+      + 'silently narrows back to the one record it was written from')
+  }
+})
+
+await test('E4.42/AC-C4-3 (cycle 4): the refusal\'s operator-facing text — quarantined here, and asserted nowhere else', () => {
+  const sp = spec()
+  const id = gateStepsOf(sp)[0]
+  const r = absentEnv(sp, pendingDoc(sp, id), 'delegationOutput')
+  assert.ok(r.err && typeof FLOW.DelegationOutputMissingError === 'function' && r.err instanceof FLOW.DelegationOutputMissingError,
+    `no typed refusal was raised, so there is no message to check (${r.err ? r.err.name : r.event && r.event.kind})`)
+  // PROSE_SOURCED, transcribed from .autoflow/issue-4-feature-design.md §4.1. The
+  // E4.33(i) pairing: E4.35 asserts class and code and never the string, this case
+  // asserts the string and never the class — a rename that keeps the text dies on
+  // E4.35, a rewrite that keeps the class dies here, and a merged case kills neither.
+  assert.equal(r.err.message, `the "${id}" step was resumed without a delegated "scores", which the caller did not supply`)
+  // The E4.20 property, at the new boundary: a name is reported, a caller-supplied
+  // value never is.
+  const marker = 'UNTRUSTED-c4-VALUE'
+  const r2 = absentEnv(sp, pendingDoc(sp, id, { issue: marker }), null, { delegationOutput: { scores: null, note: marker } })
+  assert.ok(r2.err, 'a delegated result whose required field is null must still refuse')
+  assert.ok(!r2.err.message.includes(marker), `the refusal echoes a caller-supplied value: ${r2.err.message}`)
+})
+
+await test('E4.43/AC-C4-2,5 (cycle 4): the reviewer\'s own witness, end to end — the CLI leaves the state file BYTE-identical', () => {
+  const dir = tmpRoot()
+  const path = join(dir, 'reviewer-witness.json')
+  // The exact document of the finding: pending on a gate step, no delegation output —
+  // which is not an exotic embedder scenario but the shipped entry point's ONLY
+  // behaviour, since engine/cli.mjs never supplies delegationOutput.
+  const sp = spec()
+  const id = gateStepsOf(sp)[0]
+  writeFileSync(path, JSON.stringify(pendingDoc(sp, id)))
+  const sha = (p) => createHash('sha256').update(readFileSync(p)).digest('hex')
+  const before = sha(path)
+  const res = runCli(path)
+  const after = sha(path)
+  assert.equal(after, before,
+    'the CLI rewrote the state file for a resume whose evaluation never ran — '
+    + `it now reads ${JSON.stringify(consequential(JSON.parse(readFileSync(path, 'utf8'))))}, and the damage is on disk`)
+  assert.notEqual(res.status, 0, 'the child must fail identifiably')
+  // The code, not the exit value: an uncaught typed throw exits 1 today, and pinning
+  // 1 would forbid a cleaner CLI error boundary without a test edit.
+  assert.match(res.stderr, /delegation-output-missing|DelegationOutputMissingError/,
+    `the child reported ${JSON.stringify(res.stderr.split('\n')[0] || '')} instead of the refusal that should have stopped it`)
+})
+
+await test('E4.44/AC-C4-5 (cycle 4): the non-regression baseline and the new refusal are DISJOINT by construction', () => {
+  const sp = spec()
+  // GREEN-BEFORE: a property of the harness, authored to stay true. Without it,
+  // E4.33(ii)'s digest could absorb the new behaviour and silently vacate the only
+  // non-regression evidence the executor change has — after cycle 4, E4.33(ii) green
+  // proves nothing unless the corpus resumes are known to supply an output.
+  const pending = acceptanceCorpus().filter((d) => d.pending !== null)
+  assert.ok(pending.length > 0, 'precondition: the corpus must exhibit pending documents, or the disjointness claim is vacuous')
+  assert.equal(pending.length, 25, 'the corpus\'s pending-document count moved; re-derive the disjointness claim before trusting the digest')
+  for (const doc of pending) {
+    const r = runFlow(sp, { state: JSON.parse(JSON.stringify(doc)), outcomes: mainLine(), persist: () => {}, statePath: SCRATCH_STATE, maxSteps: 80 })
+    assert.ok(r.events.length > 0, `a pending corpus document drove no event: ${JSON.stringify(consequential(doc))}`)
+  }
+})
+
+await test('E4.45/AC-C4-6 (cycle 4): the cycle\'s change surface is pinned to three files, and run-state.mjs comment-only', () => {
+  // Vacuously green at the cycle base and load-bearing the moment GREEN commits.
+  const base = '359bc8b'
+  const out = gitTry(['diff', '--name-only', `${base}..HEAD`])
+  assert.ok(out !== null, `precondition: the cycle base ${base} must be reachable`)
+  const files = out.split('\n').map((s) => s.trim()).filter(Boolean)
+  const FREE = ['engine/flow.mjs', 'test/engine/run.mjs']
+  const COMMENT_ONLY = 'engine/run-state.mjs'
+  const outside = files.filter((f) => !FREE.includes(f) && f !== COMMENT_ONLY)
+  assert.deepEqual(outside, [], `files outside the cycle's allowed set: ${outside.join(', ')}`)
+  if (files.includes(COMMENT_ONLY)) {
+    // Strictly stronger than excluding the file: the citation sweep GREEN must do is
+    // admitted, while the STATE_FIELDS / STATE_UNENFORCED contract change AC-C4 rules
+    // out is not. A pin that reds against a change another case requires is a false
+    // pin, and the pressure it creates is to delete it.
+    const diff = gitTry(['diff', `${base}..HEAD`, '--', COMMENT_ONLY]) || ''
+    const code = diff.split('\n')
+      .filter((l) => (l.startsWith('+') || l.startsWith('-')) && !l.startsWith('+++') && !l.startsWith('---'))
+      .map((l) => l.slice(1).trim())
+      .filter((l) => l !== '' && !l.startsWith('//'))
+    assert.deepEqual(code, [], `${COMMENT_ONLY} may be swept for citations but its contract is frozen; non-comment lines changed:\n        ${code.join('\n        ')}`)
+  }
+})
+
+await test('E4.47/AC-C4-1,2 (cycle 4): the predicate\'s far edge — a `scores` that is PRESENT but is not a score table', () => {
+  const sp = spec()
+  // GREEN-BEFORE on all eight rows: a preserved-invariant pin. Its value is that it
+  // reds the day someone widens the predicate past ABSENCE, and that a fifth reviewer
+  // seeding one of these meets a declared decision instead of an unexamined hole.
+  // The two passing rows are a DECLARED ACCEPTED BEHAVIOUR of computeVerdict, filed
+  // as O7 against engine/gate.mjs — which AC-C4 point 6 freezes. Closing them in
+  // engine/flow.mjs would fix the witness on the resume path only and leave it live
+  // for every other caller: a partial patch in the wrong module, which is the shape
+  // of finding this cycle exists to stop shipping.
+  const id = gateStepsOf(sp)[0]
+  const capKey = RT.CAP_EDGES[`${id}:fail`].capKey
+  const failClosed = [{ scores: 0 }, { scores: false }, { scores: '' }, { scores: [] }, { scores: {} }]
+  for (const output of failClosed) {
+    const r = absentEnv(sp, pendingDoc(sp, id), null, { delegationOutput: output })
+    assert.ok(!r.err, `${JSON.stringify(output)}: refused — a present falsy value is not an absence: ${r.err && r.err.message}`)
+    assert.equal(r.event.outcome, 'fail', `${JSON.stringify(output)}: must route the declared fail edge`)
+    assert.equal(r.after.counters[capKey], 1, `${JSON.stringify(output)}: must spend exactly one ${capKey}`)
+  }
+  // A per-entry numericity refusal the engine already ships — NOT a table-shape guard.
+  const nonNumeric = absentEnv(sp, pendingDoc(sp, id), null, { delegationOutput: { scores: 'x' } })
+  assert.ok(nonNumeric.err && nonNumeric.err.code === 'scores-not-evaluable', `{scores:'x'} must keep its existing typed refusal, got ${nonNumeric.err && nonNumeric.err.code}`)
+  assert.deepEqual(nonNumeric.writes, [], '{scores:\'x\'} must still write nothing')
+  // O7, pinned rather than latent: these fabricate a PASS from a present-but-invalid
+  // value. Declared here so review 5 starts from a written decision.
+  for (const output of [{ scores: '9' }, { scores: [9, 9] }]) {
+    const r = absentEnv(sp, pendingDoc(sp, id), null, { delegationOutput: output })
+    assert.ok(!r.err, `${JSON.stringify(output)}: ${r.err && r.err.message}`)
+    assert.equal(r.event.outcome, 'pass', `${JSON.stringify(output)}: O7 — a declared accepted behaviour of computeVerdict, filed against engine/gate.mjs`)
+  }
+})
+
+await test('E4.50/AC-C4-5 (cycle 4): the CLI drive loop breaks on a non-transition event and on nothing else', () => {
+  // E5.3(e)'s original witness IS the defect, so the claim it made ("the CLI keeps
+  // driving") has to be re-pinned where it is still observable. Under M1's shipped
+  // wiring the CLI can no longer traverse an edge at all, so the loop's SHAPE is the
+  // observable — the E6.7 source-assertion idiom, not a behavioural drive.
+  const src = engineSrc('cli.mjs')
+  const loop = /for\s*\(;;\)\s*\{([\s\S]*?)\n\}/.exec(src)
+  assert.ok(loop, 'engine/cli.mjs no longer carries the unconditional drive loop this claim is about')
+  const body = loop[1]
+  const breaks = body.match(/\bbreak\b/g) || []
+  assert.equal(breaks.length, 1, `the drive loop must have exactly one exit, found ${breaks.length}`)
+  assert.match(body, /if\s*\(\s*event\.kind\s*!==\s*'transition'\s*\)\s*break/,
+    'the loop\'s single exit must be the non-transition guard; any other condition changes what a CLI resume does')
+  assert.ok(!/\btry\b|\bcatch\b/.test(body), 'the loop must keep no error boundary — E5.3(f)/(g) pin the exit-code surface that a catch would move')
+})
+
+await test('E4.51/AC-C4-3 (cycle 4): the gate\'s required field is grounded in the ROLE DECLARATION, not invented in the engine', () => {
+  const sp = spec()
+  // GREEN-BEFORE: a preserved-invariant pin. §5.2 introduces exactly one hard-coded
+  // field name; a ground stated only in prose desynchronises silently.
+  const gates = gateStepsOf(sp)
+  for (const id of gates) {
+    assert.deepEqual(rolesOf(stepOf(sp, id)), ['evaluator'], `${id}: every gate step must delegate to the evaluator role`)
+  }
+  const evaluator = mget(sp.roles, 'evaluator')
+  assert.ok(evaluator && evaluator.output, 'the evaluator role must declare an output contract')
+  // The trap this case exists to disarm, and it is not hypothetical: the loader
+  // CAMELISES must_contain -> mustContain. A case written against the un-camelised
+  // key reads undefined and either throws on .includes or — written defensively —
+  // passes vacuously forever. The non-empty-array precondition is what forbids that.
+  const must = evaluator.output.mustContain
+  assert.ok(Array.isArray(must) && must.length > 0,
+    `the evaluator's declared output carries no non-empty mustContain (got ${JSON.stringify(evaluator.output)}) — `
+    + 'a membership test against this would pass vacuously')
+  assert.ok(must.includes('scores'),
+    'engine/flow.mjs hard-codes `scores` as the gate\'s required delegated field; the role declaration no longer promises it, '
+    + 'so the refusal would fire on a value no adapter is told to supply')
+})
+
+await test('E4.52/carried-item (cycle 4): the `thresholds` validity fail-open is DECLARED, on every gate step', () => {
+  const sp = spec()
+  // GREEN-BEFORE: a preserved-invariant pin on the axis AC-C4 excludes. A PRESENT but
+  // empty threshold table imposes no floor, so every score passes — a fabricated
+  // PASS, strictly more severe than the finding, and deliberately NOT fixed here:
+  // engine/gate.mjs is frozen by AC-C4 point 6, and a guard added to engine/flow.mjs
+  // would close the witness on the resume path only. Filed as O1. Absence of
+  // `thresholds` is a different axis and is admissible (E4.40's b-i row).
+  for (const id of gateStepsOf(sp)) {
+    const capKey = RT.CAP_EDGES[`${id}:fail`].capKey
+    const failing = absentEnv(sp, pendingDoc(sp, id), null, { delegationOutput: { scores: { a: 1 } } })
+    assert.equal(failing.event.outcome, 'fail', `${id}: precondition — this score table must fail under the DEFAULT thresholds`)
+    assert.equal(failing.after.counters[capKey], 1, `${id}: precondition — a real fail spends the budget`)
+    const open = absentEnv(sp, pendingDoc(sp, id), null, { delegationOutput: { scores: { a: 1 } }, thresholds: {} })
+    assert.equal(open.event.outcome, 'pass', `${id}: O1 — an empty threshold table is a declared accepted behaviour of computeVerdict`)
+    assert.equal(open.event.to, mget(stepOf(sp, id).next, 'pass'), `${id}: O1 — it routes to the declared pass target`)
+    assert.deepEqual(open.after.counters, {}, `${id}: O1 — and spends nothing`)
+  }
+})
+
+await test('E4.53/AC-C4 (cycle 4): b-iii\'s second conjunct — an absent statePath completes the transition at the WRONG path', () => {
+  // GREEN-BEFORE: a preserved-invariant pin, filed as O2 against engine/run-state.mjs,
+  // which AC-C4 point 6 freezes. It is REQUIRED rather than optional: b-iii admits the
+  // statePath row only if the port-level consequence is declared on the row AND pinned
+  // by a case. Without it the row is admitted on an undischarged condition.
+  //
+  // The child process and the temp cwd ARE the point. saveState writes `${path}.tmp`
+  // before renaming, so an absent path deposits a complete state document at
+  // ./undefined.tmp in the process CWD. Run in-process, that lands in the repo tree and
+  // surfaces as a dirty-tree failure at DELIVER; process.chdir() is not a substitute
+  // because it leaks to every case that follows in the same run.
+  const dir = mkdtempSync(join(tmpdir(), 'autoflow-biii-'))
+  try {
+    const script = join(dir, 'probe.mjs')
+    writeFileSync(script, [
+      `import { advance } from ${JSON.stringify(join(root, 'engine', 'flow.mjs'))}`,
+      `import { loadSpec } from ${JSON.stringify(join(root, 'engine', 'spec-load.mjs'))}`,
+      `import { saveState } from ${JSON.stringify(join(root, 'engine', 'run-state.mjs'))}`,
+      `const sp = loadSpec(${JSON.stringify(root)})`,
+      `const doc = ${JSON.stringify(pendingDoc(spec(), gateStepsOf(spec())[0]))}`,
+      'const base = { artifacts: {}, effects: {}, delegationOutput: { scores: { a: 9, b: 9, c: 9 } }, persist: saveState }',
+      'let out = { threw: null, code: null }',
+      'try { advance(sp, JSON.parse(JSON.stringify(doc)), { ...base }) } catch (e) { out.threw = e.constructor.name; out.code = e.code }',
+      'const ctl = advance(sp, JSON.parse(JSON.stringify(doc)), { ...base, statePath: "control.json" })',
+      'out.control = { historyLen: ctl.state.history.length, counters: ctl.state.counters, step: ctl.state.step, pendingStep: ctl.state.pending ? ctl.state.pending.step : null }',
+      'process.stdout.write(JSON.stringify(out))',
+    ].join('\n'))
+    const raw = execFileSync(process.execPath, [script], { cwd: dir, encoding: 'utf8' })
+    const out = JSON.parse(raw)
+    // (i) the stop is typed by the PLATFORM, not by the engine's vocabulary — which is
+    // exactly what puts this row in b-iii rather than b-ii.
+    assert.equal(out.threw, 'TypeError', `the absent statePath must stop inside the port, got ${out.threw}`)
+    assert.equal(out.code, 'ERR_INVALID_ARG_TYPE', 'the port\'s stop must carry the platform code')
+    assert.ok(!ENGINE_ERROR_NAMES.has(out.threw), 'a stop inside the engine vocabulary would be b-ii, not b-iii')
+    // (ii) the leak is asserted at its FULL severity: not a stray empty file, but a
+    // complete document whose projection equals the control's. The transition
+    // COMPLETED, at the wrong path. The byte count is deliberately not pinned — it
+    // varies with the driving document.
+    const leaked = join(dir, 'undefined.tmp')
+    assert.ok(existsSync(leaked), 'engine/run-state.mjs is expected to leak ./undefined.tmp; if it no longer does, O2 is closed and this pin must be retired deliberately')
+    assert.deepEqual(consequential(JSON.parse(readFileSync(leaked, 'utf8'))), out.control,
+      'O2 — the leaked document must be the completed transition, or this pin understates the finding to "debris"')
+    // (iii) nothing escaped the sandbox.
+    assert.ok(!existsSync(join(root, 'undefined.tmp')), 'the probe wrote outside its sandbox and into the repository tree')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('E4.48/AC-C4-4 (cycle 4): the citation scan REACHES the engine\'s own comments — swept by a case, not by hand', () => {
+  // GREEN-BEFORE: the seven flow.mjs lines engine/run-state.mjs cites all resolve
+  // correctly at the cycle base — cycle 3's hand sweep is still correct. The case
+  // exists because the class this cycle inserts shifts every one of them, so the
+  // third sweep is mechanised rather than remembered. That is the whole argument, and
+  // it does not depend on the citations being stale today.
+  const scanned = new Set(CITED_SOURCES)
+  const missing = engineSources().map(([f]) => `engine/${f}`).filter((rel) => !scanned.has(rel))
+  assert.deepEqual(missing, [],
+    `engine modules whose own citations nothing checks: ${missing.join(', ')} — each was swept by hand in cycle 3, `
+    + 'and a hand sweep is what this cycle is replacing')
+  // The scan must actually be finding engine-side citations, or the widening is
+  // decorative: a scope that covers the files but resolves nothing is indistinguishable
+  // from the un-widened guard.
+  const found = new Set()
+  for (const [f] of engineSources()) {
+    for (const m of engineSrc(f).matchAll(CITATION_RE())) found.add(`${m[1]}:${m[2]}`)
+  }
+  assert.ok(found.size > 5, `the widened scan found ${found.size} engine-side citations; the sweep it replaces covered seven flow.mjs lines alone`)
+  const unregistered = [...found].filter((k) => !(k in LINE_ANCHOR_TOKENS)).sort()
+  assert.deepEqual(unregistered, [],
+    `engine-side citations with no token to check them against: ${unregistered.join(', ')} — E6.7 resolves them, `
+    + 'this case is what keeps them in scope')
+})
+
+await test('E4.46/adequacy (cycle 4): the mutation battery — each mutant applied to the INPUTS, with its killing check run', () => {
+  const sp = spec()
+  const rows = boundaryRows()
+  assert.ok(rows.length > 5, 'precondition: the battery needs the declaration to exist')
+  const reads = extractEnvReads(engineSrc('flow.mjs'))
+  const covered = (rs) => new Set(rs.map((r) => String(r.input).split('.')[0]))
+  const uncovered = (rs) => [...new Set(reads.map((r) => r.key))].filter((k) => !covered(rs).has(k))
+
+  assert.deepEqual(uncovered(rows), [], 'precondition: the unmutated declaration must cover every env read')
+  // drop a row -> E4.39's totality reds
+  for (const victim of rows) {
+    const left = rows.filter((r) => r !== victim)
+    if (rows.filter((r) => String(r.input).split('.')[0] === String(victim.input).split('.')[0]).length > 1) continue
+    assert.ok(uncovered(left).length > 0, `mutant survives — dropping the ${victim.input} row left the totality check green`)
+  }
+  // run the extractor RAW -> the comment occurrence counts as a read
+  const raw = [...engineSrc('flow.mjs').matchAll(/\benv\.([A-Za-z_]\w*)/g)]
+  assert.ok(raw.length > reads.length,
+    'mutant survives — a raw extractor counts no more reads than the stripped one, so the comment-stripping pin is not load-bearing')
+  // a disposition outside the rule's four -> E4.39 reds
+  assert.ok(!DISPOSITIONS.includes('PASS-THROUGH'), 'mutant survives — a label outside the rule\'s four is admissible')
+  // D1' — promoting the naming clause to a b-ii conjunct kills both typed-stop rows.
+  // This is the demonstration that the narrowing is forced by measurement rather than
+  // chosen for convenience, and it is why the applied rule decides b-ii by the engine
+  // vocabulary alone.
+  const declaredRows = new Map(rows.map((r) => [`${r.input}@${r.site}`, r]))
+  let killedByNaming = 0
+  for (const d of boundaryDrivings(sp).filter((x) => x.bucket === 'b-ii')) {
+    const v = absentVsControl(sp, d.doc, d.key, declaredRows.get(`${d.input}@${d.site}`), d.overrides)
+    if (v.bucket === 'b-ii' && !v.namesInput) killedByNaming++
+  }
+  assert.equal(killedByNaming, 2,
+    'the naming clause is no longer false on both typed-stop rows — promote it to a conjunct in ALL THREE carriers, '
+    + 'or restate the rule; what is inadmissible is the two halves disagreeing')
+  // Stated limit, not overclaimed: mutants INSIDE engine/flow.mjs (reverting the
+  // coercion, refusing only on gate_plan, refusing after transitionOn() has written,
+  // resolving as haltOn(), refusing on !output.scores) cannot be applied from a test
+  // file. They are killed by the polarity of E4.35 / E4.35's derived gate set / E4.36
+  // / E4.36 + E4.43 / E4.47 respectively, each of which fails against exactly one.
+})
+
+// ================================================================================
 // GROUP 5 — the non-interactive escalate protocol (AC5)
 // ================================================================================
 
@@ -3125,38 +3948,38 @@ await test('E5.3(c)/AC5: engine/cli.mjs spawned as a child exits 2 on escalate a
   assert.equal(end.status, 0)
 })
 
-await test('E5.3(e)/AC5: the CLI keeps DRIVING after a transition — it does not stop at the first hop', () => {
+await test('E5.3(e)/AC5 (re-authored, cycle 4): the CLI cannot traverse an edge from a pending resume — the M1 wiring limitation, stated', () => {
   const sp = spec()
   const dir = tmpRoot()
   const path = join(dir, 'run-4-driving.json')
-  // A state pending on a gate step. The CLI supplies no delegation output, so
-  // computeVerdict() sees no scores and fails closed — one real transition, to
-  // gate_plan's declared `fail` target. The CLI carries NO_EFFECTS and an empty
-  // artifacts map, so the SUCCESSOR step cannot be served: a CLI that keeps driving
-  // reaches it and the engine refuses there (the CLI has no error boundary, by
-  // design — feature design §3 makes it a ≤15-line entry), while a CLI that breaks
-  // after the first hop instead reports an orderly escalate. The successor's typed
-  // refusal on stderr is therefore the witness that the loop iterated.
-  const successor = mget(stepOf(sp, 'gate_plan').next, 'fail')
-  writeFileSync(path, JSON.stringify({
-    version: RS.STATE_VERSION, issue: '#4', step: 'gate_plan', counters: {}, history: [],
-    pending: { step: 'gate_plan', roles: ['evaluator'], request: { step: 'gate_plan', roles: ['evaluator'] } },
-    status: 'delegating', terminal: null, halt: null,
-  }))
+  // [DENY] deleting this case. Its ORIGINAL witness was the defect: it seeded a
+  // document pending on a gate step with no delegation output, and asserted that the
+  // CLI persisted one `fail` transition and was then refused at the successor — i.e.
+  // it used a fabricated verdict as the evidence that the drive loop iterated. The
+  // fabricated verdict is what cycle 4 removes, so the old assertions cannot survive
+  // the fix and are re-authored rather than deleted.
+  //
+  // What replaces them, in the design's own terms: under M1's shipped wiring the CLI
+  // can no longer traverse an edge AT ALL from a pending resume — it supplies no
+  // delegationOutput, so the first hop refuses. The loop's SHAPE (it breaks on a
+  // non-transition event and on nothing else) is re-pinned by E4.50 as a source
+  // assertion, and the product-level half — nonzero exit, the refusal's code on
+  // stderr, the state file byte-identical — is E4.43's. This case holds the
+  // limitation itself: the successor step is never reached, which is the exact
+  // inversion of the claim the defect used to support.
+  const id = gateStepsOf(sp)[0]
+  const successor = mget(stepOf(sp, id).next, 'fail')
+  assert.ok(successor, `precondition: ${id} must declare a fail target for the old claim to have had a witness`)
+  writeFileSync(path, JSON.stringify(pendingDoc(sp, id)))
   const res = runCli(path)
-  assert.notEqual(res.status, ESC.EXIT_CODES.escalate,
-    'the CLI reported an orderly escalate after one hop — its drive loop never iterated')
-  assert.match(res.stderr, /missing-slot|MissingSlotError/,
-    `the CLI must have reached ${successor} and been refused there`)
-
-  // The hop it did make is on record, so "it kept driving" is not confused with
-  // "it never started".
+  assert.notEqual(res.status, 0, 'a resume that cannot proceed must fail identifiably')
+  assert.doesNotMatch(res.stderr, /missing-slot|MissingSlotError/,
+    `the CLI reached ${successor} and was refused THERE, which means it traversed an edge on a verdict no evaluation produced`)
   const after = JSON.parse(readFileSync(path, 'utf8'))
-  assert.equal(after.history.length, 1, 'the first transition must have been persisted')
-  assert.deepEqual(
-    { from: after.history[0].from, outcome: after.history[0].outcome, to: after.history[0].to },
-    { from: 'gate_plan', outcome: 'fail', to: successor },
-  )
+  assert.equal(after.history.length, 0, 'no hop may be persisted for an evaluation that never ran')
+  assert.ok(after.pending && after.pending.step === id,
+    'the pending record must SURVIVE, so the run is still resumable once the adapter output arrives — '
+    + 'a halt-shaped resolution would destroy exactly the record the resume needs')
 })
 
 await test('E5.3(d)/AC5: the CLI actually RAN persist and notify — not merely a hard-coded exit code', () => {
